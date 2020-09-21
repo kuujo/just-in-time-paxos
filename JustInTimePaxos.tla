@@ -96,13 +96,13 @@ IsPrimary(r) == Primary(viewID[r]) = r
 
 \* Messaging helpers
 
-Sends(m) == messages' = messages \cup m
+Sends(ms) == messages' = messages \cup ms
 
 Send(m) == Sends({m})
 
-Reply(req, res) == messages' = messages \cap {req, res}
+Reply(req, res) == messages' = (messages \cup {res}) \ {req}
 
-Discard(m) == messages' = messages \cap {m}
+Discard(m) == messages' = messages \ {m}
 
 ----
 
@@ -119,24 +119,24 @@ Write(c) ==
     /\ AdvanceTime(c)
     /\ requestID' = [requestID EXCEPT ![c] = requestID[c] + 1]
     /\ Sends({[source    |-> c,
-                      target    |-> r,
-                      type      |-> WriteRequest,
-                      requestID |-> requestID'[c],
-                      timestamp |-> CurrentTime(c)] : r \in Replicas})
+               target    |-> r,
+               type      |-> WriteRequest,
+               requestID |-> requestID'[c],
+               timestamp |-> CurrentTime(c)] : r \in Replicas})
     /\ UNCHANGED <<globalVars, replicaVars, responses, writes, reads>>
 
 Read(c) ==
     /\ requestID' = [requestID EXCEPT ![c] = requestID[c] + 1]
     /\ Sends({[source    |-> c,
-                      target    |-> r,
-                      type      |-> ReadRequest,
-                      requestID |-> requestID'[c]] : r \in Replicas})
+               target    |-> r,
+               type      |-> ReadRequest,
+               requestID |-> requestID'[c]] : r \in Replicas})
     /\ UNCHANGED <<globalVars, replicaVars, globalTime, time, responses, writes, reads>>
 
 IsCommitted(acks) ==
     \E msgs \in SUBSET acks :
        /\ {m.source : m \in msgs} \in Quorums
-       /\ \E m1 \in msgs : \A m2 \in msgs : m1.viewID = m2.viewID /\ m1.checksum \cap m2.checksum = {}
+       /\ \E m1 \in msgs : \A m2 \in msgs : m1.viewID = m2.viewID /\ m1.checksum \ m2.checksum = {}
        /\ \E m \in msgs : m.primary
 
 HandleWriteResponse(c, r, m) ==
@@ -155,7 +155,7 @@ HandleWriteResponse(c, r, m) ==
                 \/ /\ ~committed
                    /\ UNCHANGED <<writes>>
     /\ Discard(m)
-    /\ UNCHANGED <<globalVars, messageVars, replicaVars, globalTime, time, requestID, reads>>
+    /\ UNCHANGED <<globalVars, replicaVars, globalTime, time, requestID, reads>>
 
 HandleReadResponse(c, r, m) ==
     /\ \/ /\ m.primary
@@ -164,7 +164,7 @@ HandleReadResponse(c, r, m) ==
        \/ /\ ~m.primary
           /\ UNCHANGED <<reads>>
     /\ Discard(m)
-    /\ UNCHANGED <<globalVars, replicaVars, globalTime, time, requestID, writes>>
+    /\ UNCHANGED <<globalVars, replicaVars, globalTime, time, requestID, responses, writes>>
 
 ----
 
@@ -204,7 +204,7 @@ HandleReadRequest(r, c, m) ==
     /\ Len(log[r]) > 0
     /\ Reply(m, [source    |-> r,
                  target    |-> c,
-                 type      |-> WriteResponse,
+                 type      |-> ReadResponse,
                  requestID |-> m.requestID,
                  viewID    |-> viewID[r],
                  primary   |-> IsPrimary(r),
@@ -271,57 +271,59 @@ Inv == \A c1, c2 \in Clients :
              \E w \in writes[c2] : 
                 r.index = w.index /\ r.requestID # w.requestID
 
+Transition == transitions' = transitions + 1
+
 Next ==
     \/ \E c \in Clients :
        /\ Write(c)
        /\ transitions' = transitions + 1
     \/ \E c \in Clients : 
        /\ Read(c)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = WriteRequest
        /\ HandleWriteRequest(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = WriteResponse
        /\ HandleWriteResponse(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = ReadRequest
        /\ HandleReadRequest(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = ReadResponse
        /\ HandleReadResponse(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = ViewChangeRequest
        /\ HandleViewChangeRequest(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = ViewChangeResponse
        /\ HandleViewChangeResponse(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = StartViewRequest
        /\ HandleStartViewRequest(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = SyncPrepareRequest
        /\ HandleSyncPrepareRequest(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = SyncPrepareResponse
        /\ HandleSyncPrepareResponse(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = SyncCommitRequest
        /\ HandleSyncCommitRequest(m.target, m.source, m)
-       /\ transitions' = transitions + 1
+       /\ Transition
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Sun Sep 20 18:45:13 PDT 2020 by jordanhalterman
+\* Last modified Sun Sep 20 19:48:11 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
