@@ -183,8 +183,12 @@ HandleWriteRequest(r, c, m) ==
              \/ /\ Len(log[r]) # 0
                 /\ m.timestamp > log[r][Len(log[r])].timestamp
           /\ LET checksum == Append([i \in DOMAIN log[r] |-> log[r][i].timestamp], m.timestamp)
+                 entry    == [client    |-> c,
+                              requestID |-> m.requestID,
+                              timestamp |-> m.timestamp,
+                              checksum  |-> checksum]
              IN
-                /\ log' = [log EXCEPT ![r] = Append(log[r], m @@ ("checksum" :> checksum))]
+                /\ log' = [log EXCEPT ![r] = Append(log[r], entry)]
                 /\ Reply(m, [src       |-> r,
                              dest      |-> c,
                              type      |-> WriteResponse,
@@ -254,9 +258,7 @@ HandleViewChangeResponse(r, s, m) ==
     /\ IsPrimary(r)
     /\ viewChangeResponses' = [viewChangeResponses EXCEPT ![r] = viewChangeResponses[r] \cup {m}]
     /\ LET
-          isViewPromise(M) ==
-             /\ {n.src : n \in M} \in Quorums
-             /\ \E n \in M : n.src = r
+          isViewQuorum(vs) == IsQuorum(vs) /\ \E v \in vs : v.src = r
           viewChanges == {n \in viewChangeResponses[r] : n.type = ViewChangeResponse /\ n.viewID = viewID[r]}
           normalViews == {n.lastNormal : n \in viewChanges}
           lastNormal == {CHOOSE v \in normalViews : \A v2 \in normalViews : v2 < v}
@@ -265,7 +267,7 @@ HandleViewChangeResponse(r, s, m) ==
              LET 
                 logsWith(i) == {l \in ls : Len(l) >= i}
                 entries(i) == {l[i] : l \in logsWith(i)}
-                quorums(i) == {l \in SUBSET logsWith(i) : Cardinality(l) * 2 > Cardinality(Replicas)}
+                quorums(i) == {l \in SUBSET logsWith(i) : IsQuorum(l)}
                 checksums(l, i) == {e.checksum : e \in l[i]}
                 isCommitted(i) == \E e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
                 committed(i) == CHOOSE e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
@@ -274,12 +276,13 @@ HandleViewChangeResponse(r, s, m) ==
              IN
                 [i \in 1..maxCommitted |-> committed(i)]
        IN
-          IF isViewPromise(viewChanges) THEN
+          \/ /\ isViewQuorum(viewChanges)
              /\ Replies(m, {[src    |-> r,
                              dest   |-> d,
+                             type   |-> StartViewRequest,
                              viewID |-> viewID[r],
                              log    |-> combineLogs(goodLogs)] : d \in Replicas})
-          ELSE
+          \/ /\ ~isViewQuorum(viewChanges)
              /\ Discard(m)
     /\ UNCHANGED <<globalVars, clientVars, status, viewID, log, lastNormalView>>
 
@@ -287,7 +290,7 @@ HandleStartViewRequest(r, s, m) ==
     /\ \/ viewID[r] < m.viewID
        \/ /\ viewID[r] = m.viewID
           /\ status[r] = ViewChangeStatus
-    /\ log' = [log EXCEPT ![r] = m.log]
+    /\ log'    = [log EXCEPT ![r] = m.log]
     /\ status' = [status EXCEPT ![r] = NormalStatus]
     /\ viewID' = [viewID EXCEPT ![r] = m.viewID]
     /\ lastNormalView' = [lastNormalView EXCEPT ![r] = m.viewID]
@@ -341,46 +344,46 @@ Transition == transitions' = transitions + 1
 
 Next ==
     \/ \E c \in Clients :
-       /\ Write(c)
-       /\ Transition
+          /\ Write(c)
+          /\ Transition
     \/ \E c \in Clients : 
-       /\ Read(c)
-       /\ Transition
+          /\ Read(c)
+          /\ Transition
     \/ \E r \in Replicas : 
-       /\ ChangeView(r)
-       /\ Transition
+          /\ ChangeView(r)
+          /\ Transition
     \/ \E m \in messages :
-       /\ m.type = WriteRequest
-       /\ HandleWriteRequest(m.dest, m.src, m)
-       /\ Transition
+          /\ m.type = WriteRequest
+          /\ HandleWriteRequest(m.dest, m.src, m)
+          /\ Transition
     \/ \E m \in messages :
-       /\ m.type = WriteResponse
-       /\ HandleWriteResponse(m.dest, m.src, m)
-       /\ Transition
+          /\ m.type = WriteResponse
+          /\ HandleWriteResponse(m.dest, m.src, m)
+          /\ Transition
     \/ \E m \in messages :
-       /\ m.type = ReadRequest
-       /\ HandleReadRequest(m.dest, m.src, m)
-       /\ Transition
+          /\ m.type = ReadRequest
+          /\ HandleReadRequest(m.dest, m.src, m)
+          /\ Transition
     \/ \E m \in messages :
-       /\ m.type = ReadResponse
-       /\ HandleReadResponse(m.dest, m.src, m)
-       /\ Transition
+          /\ m.type = ReadResponse
+          /\ HandleReadResponse(m.dest, m.src, m)
+          /\ Transition
     \/ \E m \in messages :
-       /\ m.type = ViewChangeRequest
-       /\ HandleViewChangeRequest(m.dest, m.src, m)
-       /\ Transition
+          /\ m.type = ViewChangeRequest
+          /\ HandleViewChangeRequest(m.dest, m.src, m)
+          /\ Transition
     \/ \E m \in messages :
-       /\ m.type = ViewChangeResponse
-       /\ HandleViewChangeResponse(m.dest, m.src, m)
-       /\ Transition
+          /\ m.type = ViewChangeResponse
+          /\ HandleViewChangeResponse(m.dest, m.src, m)
+          /\ Transition
     \/ \E m \in messages :
-       /\ m.type = StartViewRequest
-       /\ HandleStartViewRequest(m.dest, m.src, m)
-       /\ Transition
+          /\ m.type = StartViewRequest
+          /\ HandleStartViewRequest(m.dest, m.src, m)
+          /\ Transition
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Mon Sep 21 14:10:18 PDT 2020 by jordanhalterman
+\* Last modified Mon Sep 21 15:12:31 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
