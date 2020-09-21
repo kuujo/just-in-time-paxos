@@ -23,16 +23,9 @@ CONSTANTS
 
 \* Server request/response types
 CONSTANTS
-                         \* SlotLookup
-                         \* SlotLookupRep
-                         \* GapCommit
-                         \* GapCommitRep
-    ViewChangeRequest,   \* ViewChangeReq
-    ViewChangeResponse,  \* ViewChange
-    StartViewRequest,    \* StartView
-    SyncPrepareRequest,  \* SyncPrepare
-    SyncPrepareResponse, \* SyncPrepareRep
-    SyncCommitRequest    \* SyncCommit
+    ViewChangeRequest,
+    ViewChangeResponse,
+    StartViewRequest
 
 \* Replica roles
 CONSTANTS
@@ -66,11 +59,15 @@ clientVars == <<globalTime, time, requestID, responses, writes, reads>>
 
 VARIABLE status
 
-VARIABLE viewID
-
 VARIABLE log
 
-replicaVars == <<status, viewID, log>>
+VARIABLE viewID
+
+VARIABLE lastNormalView
+
+VARIABLE viewChangeResponses
+
+replicaVars == <<status, log, viewID, lastNormalView, viewChangeResponses>>
 
 VARIABLE transitions
 
@@ -86,7 +83,11 @@ SeqFromSet(S) ==
   ELSE LET x == CHOOSE x \in S : TRUE
        IN  << x >> \o SeqFromSet(S \ {x})
 
-Quorums == {r \in SUBSET Replicas : Cardinality(r) * 2 > Cardinality(Replicas)}
+Max(s) == CHOOSE x \in s : \A y \in s : x >= y
+
+IsQuorum(s) == Cardinality(s) * 2 >= Cardinality(Replicas)
+
+Quorums == {r \in SUBSET Replicas : IsQuorum(r)}
 
 Primary(v) == replicas[(v%Len(replicas)) + (IF v >= Len(replicas) THEN 1 ELSE 0)]
 
@@ -100,7 +101,9 @@ Sends(ms) == messages' = messages \cup ms
 
 Send(m) == Sends({m})
 
-Reply(req, res) == messages' = (messages \cup {res}) \ {req}
+Replies(reqs, resps) == messages' = (messages \cup resps) \ reqs
+
+Reply(req, resp) == Replies({req}, {resp})
 
 Discard(m) == messages' = messages \ {m}
 
@@ -118,8 +121,8 @@ CurrentTime(c) == time'[c]
 Write(c) ==
     /\ AdvanceTime(c)
     /\ requestID' = [requestID EXCEPT ![c] = requestID[c] + 1]
-    /\ Sends({[source    |-> c,
-               target    |-> r,
+    /\ Sends({[src       |-> c,
+               dest      |-> r,
                type      |-> WriteRequest,
                requestID |-> requestID'[c],
                timestamp |-> CurrentTime(c)] : r \in Replicas})
@@ -127,16 +130,20 @@ Write(c) ==
 
 Read(c) ==
     /\ requestID' = [requestID EXCEPT ![c] = requestID[c] + 1]
-    /\ Sends({[source    |-> c,
-               target    |-> r,
+    /\ Sends({[src       |-> c,
+               dest      |-> r,
                type      |-> ReadRequest,
                requestID |-> requestID'[c]] : r \in Replicas})
     /\ UNCHANGED <<globalVars, replicaVars, globalTime, time, responses, writes, reads>>
 
+ChecksumsMatch(c1, c2) ==
+    /\ Len(c1) = Len(c2)
+    /\ ~\E i \in DOMAIN c1 : c1[i] # c2[i]
+
 IsCommitted(acks) ==
     \E msgs \in SUBSET acks :
-       /\ {m.source : m \in msgs} \in Quorums
-       /\ \E m1 \in msgs : \A m2 \in msgs : m1.viewID = m2.viewID /\ m1.checksum \ m2.checksum = {}
+       /\ {m.src    : m \in msgs} \in Quorums
+       /\ \E m1 \in msgs : \A m2 \in msgs : m1.viewID = m2.viewID /\ ChecksumsMatch(m1.checksum, m2.checksum)
        /\ \E m \in msgs : m.primary
 
 HandleWriteResponse(c, r, m) ==
@@ -175,67 +182,117 @@ HandleWriteRequest(r, c, m) ==
     /\ \/ /\ \/ Len(log[r]) = 0
              \/ /\ Len(log[r]) # 0
                 /\ m.timestamp > log[r][Len(log[r])].timestamp
-          /\ log' = [log EXCEPT ![r] = Append(log[r], m)]
-          /\ Reply(m, [source    |-> r,
-                       target    |-> c,
-                       type      |-> WriteResponse,
-                       requestID |-> m.requestID,
-                       viewID    |-> viewID[r],
-                       primary   |-> IsPrimary(r),
-                       index     |-> Len(log'[r]),
-                       checksum  |-> {log'[r][i].timestamp : i \in DOMAIN log'[r]},
-                       succeeded |-> TRUE])
+          /\ LET checksum == Append([i \in DOMAIN log[r] |-> log[r][i].timestamp], m.timestamp)
+             IN
+                /\ log' = [log EXCEPT ![r] = Append(log[r], m @@ ("checksum" :> checksum))]
+                /\ Reply(m, [src       |-> r,
+                             dest      |-> c,
+                             type      |-> WriteResponse,
+                             requestID |-> m.requestID,
+                             viewID    |-> viewID[r],
+                             primary   |-> IsPrimary(r),
+                             index     |-> Len(log'[r]),
+                             checksum  |-> log'[r][Len(log'[r])].checksum,
+                             succeeded |-> TRUE])
        \/ /\ Len(log[r]) # 0
           /\ m.timestamp <= log[r][Len(log[r])].timestamp
-          /\ Reply(m, [source    |-> r,
-                       target    |-> c,
+          /\ Reply(m, [src       |-> r,
+                       dest      |-> c,
                        type      |-> WriteResponse,
                        requestID |-> m.requestID,
                        viewID    |-> viewID[r],
                        primary   |-> IsPrimary(r),
                        index     |-> Len(log[r]),
-                       checksum  |-> {log[r][i].timestamp : i \in DOMAIN log[r]},
+                       checksum  |-> log[r][Len(log[r])].checksum,
                        succeeded |-> FALSE])
           /\ UNCHANGED <<log>>
-    /\ UNCHANGED <<globalVars, clientVars, status, viewID>>
+    /\ UNCHANGED <<globalVars, clientVars, status, viewID, lastNormalView, viewChangeResponses>>
 
 HandleReadRequest(r, c, m) ==
     /\ status[r] = NormalStatus
     /\ Len(log[r]) > 0
-    /\ Reply(m, [source    |-> r,
-                 target    |-> c,
+    /\ Reply(m, [src       |-> r,
+                 dest      |-> c,
                  type      |-> ReadResponse,
                  requestID |-> m.requestID,
                  viewID    |-> viewID[r],
                  primary   |-> IsPrimary(r),
                  index     |-> Len(log[r]),
-                 checksum  |-> {log[r][i].timestamp : i \in DOMAIN log[r]},
+                 checksum  |-> log[r][Len(log[r])].checksum,
                  succeeded |-> TRUE])
-    /\ UNCHANGED <<globalVars, clientVars, status, viewID, log>>
+    /\ UNCHANGED <<globalVars, clientVars, status, log, viewID, lastNormalView, viewChangeResponses>>
+
+ChangeView(r) ==
+    LET nextViewID == viewID[r] + 1
+    IN
+       /\ Primary(nextViewID) = r
+       /\ status' = [status EXCEPT ![r] = ViewChangeStatus]
+       /\ viewID' = [viewID EXCEPT ![r] = nextViewID]
+       /\ viewChangeResponses' = [viewChangeResponses EXCEPT ![r] = {}]
+       /\ Sends({[src    |-> r,
+                  dest   |-> d,
+                  type   |-> ViewChangeRequest,
+                  viewID |-> nextViewID] : d \in Replicas})
+       /\ UNCHANGED <<globalVars, clientVars, log, lastNormalView>>
 
 HandleViewChangeRequest(r, s, m) ==
-    /\ FALSE
-    /\ UNCHANGED <<globalVars, messageVars, clientVars, replicaVars>>
+    /\ viewID[r] # m.viewID
+    /\ viewID' = [viewID EXCEPT ![r] = m.viewID]
+    /\ status' = [status EXCEPT ![r] = ViewChangeStatus]
+    /\ viewChangeResponses' = [viewChangeResponses EXCEPT ![r] = {}]
+    /\ Reply(m, [src        |-> r,
+                 dest       |-> s,
+                 type       |-> ViewChangeResponse,
+                 viewID     |-> m.viewID,
+                 lastNormal |-> lastNormalView[r],
+                 log        |-> log[r]])
+    /\ UNCHANGED <<globalVars, clientVars, log, lastNormalView>>
 
 HandleViewChangeResponse(r, s, m) ==
-    /\ FALSE
-    /\ UNCHANGED <<globalVars, messageVars, clientVars, replicaVars>>
+    /\ viewID[r] = m.viewID
+    /\ status[r] = ViewChangeStatus
+    /\ IsPrimary(r)
+    /\ viewChangeResponses' = [viewChangeResponses EXCEPT ![r] = viewChangeResponses[r] \cup {m}]
+    /\ LET
+          isViewPromise(M) ==
+             /\ {n.src : n \in M} \in Quorums
+             /\ \E n \in M : n.src = r
+          viewChanges == {n \in viewChangeResponses[r] : n.type = ViewChangeResponse /\ n.viewID = viewID[r]}
+          normalViews == {n.lastNormal : n \in viewChanges}
+          lastNormal == {CHOOSE v \in normalViews : \A v2 \in normalViews : v2 < v}
+          goodLogs == {n.log : n \in {o \in viewChanges : o.lastNormal = lastNormal}}
+          combineLogs(ls) ==
+             LET 
+                logsWith(i) == {l \in ls : Len(l) >= i}
+                entries(i) == {l[i] : l \in logsWith(i)}
+                quorums(i) == {l \in SUBSET logsWith(i) : Cardinality(l) * 2 > Cardinality(Replicas)}
+                checksums(l, i) == {e.checksum : e \in l[i]}
+                isCommitted(i) == \E e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
+                committed(i) == CHOOSE e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
+                maxIndex == Max({Len(l) : l \in ls})
+                maxCommitted == Max({i \in 1..maxIndex : isCommitted(i)})
+             IN
+                [i \in 1..maxCommitted |-> committed(i)]
+       IN
+          IF isViewPromise(viewChanges) THEN
+             /\ Replies(m, {[src    |-> r,
+                             dest   |-> d,
+                             viewID |-> viewID[r],
+                             log    |-> combineLogs(goodLogs)] : d \in Replicas})
+          ELSE
+             /\ Discard(m)
+    /\ UNCHANGED <<globalVars, clientVars, status, viewID, log, lastNormalView>>
 
 HandleStartViewRequest(r, s, m) ==
-    /\ FALSE
-    /\ UNCHANGED <<globalVars, messageVars, clientVars, replicaVars>>
-
-HandleSyncPrepareRequest(r, s, m) ==
-    /\ FALSE
-    /\ UNCHANGED <<globalVars, messageVars, clientVars, replicaVars>>
-
-HandleSyncPrepareResponse(r, s, m) ==
-    /\ FALSE
-    /\ UNCHANGED <<globalVars, messageVars, clientVars, replicaVars>>
-
-HandleSyncCommitRequest(r, s, m) ==
-    /\ FALSE
-    /\ UNCHANGED <<globalVars, messageVars, clientVars, replicaVars>>
+    /\ \/ viewID[r] < m.viewID
+       \/ /\ viewID[r] = m.viewID
+          /\ status[r] = ViewChangeStatus
+    /\ log' = [log EXCEPT ![r] = m.log]
+    /\ status' = [status EXCEPT ![r] = NormalStatus]
+    /\ viewID' = [viewID EXCEPT ![r] = m.viewID]
+    /\ lastNormalView' = [lastNormalView EXCEPT ![r] = m.viewID]
+    /\ Discard(m)
+    /\ UNCHANGED <<globalVars, clientVars, viewChangeResponses>>
 
 ----
 
@@ -254,8 +311,10 @@ InitClientVars ==
 InitReplicaVars ==
     /\ replicas = SeqFromSet(Replicas)
     /\ status = [r \in Replicas |-> NormalStatus]
-    /\ viewID = [r \in Replicas |-> 1]
     /\ log = [r \in Replicas |-> <<>>]
+    /\ viewID = [r \in Replicas |-> 1]
+    /\ lastNormalView = [r \in Replicas |-> 1]
+    /\ viewChangeResponses = [r \in Replicas |-> {}]
 
 Init ==
     /\ InitMessageVars
@@ -266,64 +325,62 @@ Init ==
 ----
 
 \* The type invariant checks that no read ever reads a different value than a previous write
-Inv == \A c1, c2 \in Clients :
-          ~\E r \in reads[c1] :
-             \E w \in writes[c2] : 
-                r.index = w.index /\ r.requestID # w.requestID
+Inv == 
+   /\ \A c1, c2 \in Clients :
+         ~\E r \in reads[c1] :
+            \E w \in writes[c2] : 
+               /\ r.index = w.index 
+               /\ ~ChecksumsMatch(r.checksum, w.checksum)
+   /\ \A c1, c2 \in Clients:
+         ~\E r1 \in reads[c1] :
+            \E r2 \in reads[c2] :
+               /\ r1.index = r2.index 
+               /\ ~ChecksumsMatch(r1.checksum, r2.checksum)
 
 Transition == transitions' = transitions + 1
 
 Next ==
     \/ \E c \in Clients :
        /\ Write(c)
-       /\ transitions' = transitions + 1
+       /\ Transition
     \/ \E c \in Clients : 
        /\ Read(c)
        /\ Transition
+    \/ \E r \in Replicas : 
+       /\ ChangeView(r)
+       /\ Transition
     \/ \E m \in messages :
        /\ m.type = WriteRequest
-       /\ HandleWriteRequest(m.target, m.source, m)
+       /\ HandleWriteRequest(m.dest, m.src, m)
        /\ Transition
     \/ \E m \in messages :
        /\ m.type = WriteResponse
-       /\ HandleWriteResponse(m.target, m.source, m)
+       /\ HandleWriteResponse(m.dest, m.src, m)
        /\ Transition
     \/ \E m \in messages :
        /\ m.type = ReadRequest
-       /\ HandleReadRequest(m.target, m.source, m)
+       /\ HandleReadRequest(m.dest, m.src, m)
        /\ Transition
     \/ \E m \in messages :
        /\ m.type = ReadResponse
-       /\ HandleReadResponse(m.target, m.source, m)
+       /\ HandleReadResponse(m.dest, m.src, m)
        /\ Transition
     \/ \E m \in messages :
        /\ m.type = ViewChangeRequest
-       /\ HandleViewChangeRequest(m.target, m.source, m)
+       /\ HandleViewChangeRequest(m.dest, m.src, m)
        /\ Transition
     \/ \E m \in messages :
        /\ m.type = ViewChangeResponse
-       /\ HandleViewChangeResponse(m.target, m.source, m)
+       /\ HandleViewChangeResponse(m.dest, m.src, m)
        /\ Transition
     \/ \E m \in messages :
        /\ m.type = StartViewRequest
-       /\ HandleStartViewRequest(m.target, m.source, m)
-       /\ Transition
-    \/ \E m \in messages :
-       /\ m.type = SyncPrepareRequest
-       /\ HandleSyncPrepareRequest(m.target, m.source, m)
-       /\ Transition
-    \/ \E m \in messages :
-       /\ m.type = SyncPrepareResponse
-       /\ HandleSyncPrepareResponse(m.target, m.source, m)
-       /\ Transition
-    \/ \E m \in messages :
-       /\ m.type = SyncCommitRequest
-       /\ HandleSyncCommitRequest(m.target, m.source, m)
+       /\ HandleStartViewRequest(m.dest, m.src, m)
        /\ Transition
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Sun Sep 20 19:48:11 PDT 2020 by jordanhalterman
+\* Last modified Mon Sep 21 14:10:18 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
