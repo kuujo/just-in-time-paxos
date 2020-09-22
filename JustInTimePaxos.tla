@@ -100,10 +100,7 @@ VARIABLE rAbortResps
 replicaVars == <<rStatus, rLog, rViewID, rSeqNum, rTimestamp,
                  rLastViewID, rViewChanges, rAbortPoint, rAbortResps>>
 
-\* A counter used to limit the state space for model checking
-VARIABLE transitions
-
-vars == <<globalVars, messageVars, clientVars, replicaVars, transitions>>
+vars == <<globalVars, messageVars, clientVars, replicaVars>>
 
 ----
 
@@ -469,7 +466,6 @@ Init ==
     /\ InitMessageVars
     /\ InitClientVars
     /\ InitReplicaVars
-    /\ transitions = 0
 
 ----
 
@@ -482,60 +478,46 @@ TypeOK ==
              /\ e1.index = e2.index
              /\ e1.value # e2.value
 
-Transition == transitions' = transitions + 1
-
 Next ==
     \/ \E c \in Clients :
           \E v \in Values :
              /\ ClientRequest(c, v)
-             /\ Transition
     \/ \E r \in Replicas : 
           /\ ChangeView(r)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MClientRequest
           /\ HandleClientRequest(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MClientResponse
           /\ HandleClientResponse(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MRepairRequest
           /\ HandleRepairRequest(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MRepairResponse
           /\ HandleRepairResponse(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MAbortRequest
           /\ HandleAbortRequest(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MAbortResponse
           /\ HandleAbortResponse(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MViewChangeRequest
           /\ HandleViewChangeRequest(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MViewChangeResponse
           /\ HandleViewChangeResponse(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages :
           /\ m.type = MStartViewRequest
           /\ HandleStartViewRequest(m.dest, m.src, m)
-          /\ Transition
     \/ \E m \in messages : 
           /\ Discard(m)
-          /\ Transition
           /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 13:34:27 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 14:18:02 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
