@@ -215,12 +215,13 @@ This section models the replica protocol.
 
 \* Replica 'r' requests a repair of the client 'c' request 'm'
 Repair(r, c, m) ==
-    /\ Replies(m, {[src    |-> r,
-                    dest   |-> d,
-                    type   |-> MRepairRequest,
-                    viewID |-> rViewID[r],
-                    client |-> c,
-                    seqNum |-> rSeqNum[r][c] + 1] : d \in Replicas})
+    /\ Replies(m, {[src       |-> r,
+                    dest      |-> d,
+                    type      |-> MRepairRequest,
+                    viewID    |-> rViewID[r],
+                    client    |-> c,
+                    seqNum    |-> m.seqNum,
+                    timestamp |-> m.timestamp] : d \in Replicas})
 
 \* Replica 'r' aborts the client 'c' request 'm'
 Abort(r, c, m) ==
@@ -256,8 +257,8 @@ HandleClientRequest(r, c, m) ==
              IN
                 \/ /\ isSequential
                    /\ isLinear
-                   /\ rLog' = append(entry)
-                   /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![c] = m.seqNum]]
+                   /\ rLog'       = append(entry)
+                   /\ rSeqNum'    = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![c] = m.seqNum]]
                    /\ rTimestamp' = [rTimestamp EXCEPT ![r] = m.timestamp]
                    /\ Reply(m, [src       |-> r,
                                 dest      |-> c,
@@ -268,17 +269,13 @@ HandleClientRequest(r, c, m) ==
                                 value     |-> m.value,
                                 succeeded |-> TRUE])
                    /\ UNCHANGED <<rStatus, rAbortPoint, rAbortResps>>
-                \/ /\ \/ ~isSequential
+                \/ /\ \/ /\ ~isSequential
+                         /\ m.seqNum > rSeqNum[r][c] + 1
                       \/ ~isLinear
                    /\ \/ /\ IsPrimary(r)
                          /\ Abort(r, c, m)
                       \/ /\ ~IsPrimary(r)
-                         /\ Reply(m, [src       |-> r,
-                                      dest      |-> c,
-                                      type      |-> MClientResponse,
-                                      viewID    |-> rViewID[r],
-                                      seqNum    |-> m.seqNum,
-                                      succeeded |-> FALSE])
+                         /\ Repair(r, c, m)
                          /\ UNCHANGED <<rStatus, rAbortPoint, rAbortResps>>
                    /\ UNCHANGED <<rLog, rSeqNum, rTimestamp>>
        \/ /\ m.viewID < rViewID[r]
@@ -296,19 +293,21 @@ HandleRepairRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ IsPrimary(r)
     /\ rStatus[r] = SNormal
-    /\ LET index == Len(rLog[r][m.client]) + 1 - (rSeqNum[r] - m.seqNum)
+    /\ LET offset == Len(rLog[r][m.client]) - (rSeqNum[r][m.client] - m.seqNum)
        IN
-          /\ \/ /\ index <= Len(rLog[r][m.client])
-                /\ Reply(m, [src    |-> r,
-                             dest   |-> s,
-                             type   |-> MRepairResponse,
-                             viewID |-> rViewID[r],
-                             client |-> m.client,
-                             seqNum |-> m.seqNum])
-                /\ UNCHANGED <<rStatus, rAbortPoint, rAbortResps>>
-             \/ /\ index = Len(rLog[r][m.client]) + 1
-                /\ Abort(r, m.client, m)
-    /\ UNCHANGED <<globalVars, clientVars>>
+          \/ /\ offset <= Len(rLog[r][m.client])
+             /\ Reply(m, [src       |-> r,
+                          dest      |-> s,
+                          type      |-> MRepairResponse,
+                          viewID    |-> rViewID[r],
+                          client    |-> m.client,
+                          seqNum    |-> m.seqNum,
+                          value     |-> rLog[r][m.client][offset].value,
+                          timestamp |-> rLog[r][m.client][offset].timestamp])
+             /\ UNCHANGED <<rStatus, rAbortPoint, rAbortResps>>
+          \/ /\ offset = Len(rLog[r][m.client]) + 1
+             /\ Abort(r, m.client, m)
+    /\ UNCHANGED <<globalVars, clientVars, rLog, rSeqNum, rTimestamp, rViewID, rLastViewID, rViewChanges>>
 
 \* Replica 'r' handles replica 's' repair response 'm'
 HandleRepairResponse(r, s, m) ==
@@ -319,13 +318,13 @@ HandleAbortRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ rStatus[r] \in {SNormal, SAborting}
     /\ LET 
-           offset == Len(rLog[r][m.client]) + 1 - (rSeqNum[r][m.client] - m.seqNum)
+           offset == Len(rLog[r][m.client]) - (rSeqNum[r][m.client] - m.seqNum)
            entry == [type |-> TNoOp, timestamp |-> m.timestamp]
-           replace(i, e) == [j \in 1..Max({Len(rLog[r][m.client]), i}) |->
-                                IF j = i THEN e ELSE rLog[r][m.client][j]]
+           replace(l, i, e) == [j \in 1..Max({Len(l), i}) |-> IF j = i THEN e ELSE l[j]]
        IN
           /\ offset <= Len(rLog[r][m.client]) + 1
-          /\ rLog' = replace(offset, entry)
+          /\ rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT 
+                                  ![m.client] = replace(rLog[r][m.client], offset, entry)]]
           /\ rTimestamp' = [rTimestamp EXCEPT ![r] = Max({rTimestamp[r], m.timestamp})]
           /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT 
                                         ![m.client] = Max({rSeqNum[r][m.client], m.seqNum})]]
@@ -529,11 +528,14 @@ Next ==
           /\ m.type = MStartViewRequest
           /\ HandleStartViewRequest(m.dest, m.src, m)
           /\ Transition
-    \/ \E m \in messages : Discard(m)
+    \/ \E m \in messages : 
+          /\ Discard(m)
+          /\ Transition
+          /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 12:57:49 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 13:34:27 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
