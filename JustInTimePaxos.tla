@@ -8,18 +8,16 @@ CONSTANT Replicas
 \* The set of Paxos clients
 CONSTANT Clients
 
+\* The set of possible values
+CONSTANT Values
+
 \* An empty value
 CONSTANT Nil
 
-\* Client request/response types+
+\* Request/response types+
 CONSTANTS
-    MWriteRequest,
-    MWriteResponse,
-    MReadRequest,
-    MReadResponse
-
-\* Server request/response types
-CONSTANTS
+    MClientRequest,
+    MClientResponse,
     MRepairRequest,
     MRepairResponse,
     MAbortRequest,
@@ -57,11 +55,9 @@ VARIABLE cSeqNum
 
 VARIABLE cResps
 
-VARIABLE cWrites
+VARIABLE cCommits
 
-VARIABLE cReads
-
-clientVars == <<cTime, cViewID, cSeqNum, cResps, cWrites, cReads>>
+clientVars == <<cTime, cViewID, cSeqNum, cResps, cCommits>>
 
 VARIABLE rStatus
 
@@ -71,6 +67,8 @@ VARIABLE rViewID
 
 VARIABLE rSeqNum
 
+VARIABLE rTimestamp
+
 VARIABLE rLastView
 
 VARIABLE rViewChanges
@@ -79,7 +77,7 @@ VARIABLE rAbortSeqNum
 
 VARIABLE rAbortResps
 
-replicaVars == <<rStatus, rLog, rViewID, rSeqNum, rLastView, rViewChanges, rAbortSeqNum, rAbortResps>>
+replicaVars == <<rStatus, rLog, rViewID, rSeqNum, rTimestamp, rLastView, rViewChanges, rAbortSeqNum, rAbortResps>>
 
 VARIABLE transitions
 
@@ -91,11 +89,25 @@ vars == <<globalVars, messageVars, clientVars, replicaVars, transitions>>
 
 RECURSIVE SeqFromSet(_)
 SeqFromSet(S) == 
-  IF S = {} THEN << >> 
-  ELSE LET x == CHOOSE x \in S : TRUE
-       IN  << x >> \o SeqFromSet(S \ {x})
+    IF S = {} THEN
+        << >> 
+    ELSE LET x == CHOOSE x \in S : TRUE
+        IN  << x >> \o SeqFromSet(S \ {x})
+
+Pick(S) == CHOOSE s \in S : TRUE
+
+RECURSIVE SetReduce(_, _, _)
+SetReduce(Op(_, _), S, value) == 
+    IF S = {} THEN
+        value
+    ELSE
+        LET s == Pick(S)
+        IN SetReduce(Op, S \ {s}, Op(s, value)) 
 
 Max(s) == CHOOSE x \in s : \A y \in s : x >= y
+
+Sum(S) == LET _op(a, b) == a + b
+          IN SetReduce(_op, S, 0)
 
 IsQuorum(s) == Cardinality(s) * 2 >= Cardinality(Replicas)
 
@@ -104,8 +116,6 @@ Quorums == {r \in SUBSET Replicas : IsQuorum(r)}
 Primary(v) == replicas[(v%Len(replicas)) + (IF v >= Len(replicas) THEN 1 ELSE 0)]
 
 IsPrimary(r) == Primary(rViewID[r]) = r
-
-Replace(l, i, x) == [j \in 1..Max({Len(l), i}) |-> IF j = i THEN x ELSE l[j]]
 
 ----
 
@@ -128,56 +138,44 @@ Write(c) ==
     /\ cSeqNum' = [cSeqNum EXCEPT ![c] = cSeqNum[c] + 1]
     /\ Sends({[src       |-> c,
                dest      |-> r,
-               type      |-> MWriteRequest,
+               type      |-> MClientRequest,
                viewID    |-> cViewID[c],
                seqNum  |-> cSeqNum'[c],
                timestamp |-> cTime'] : r \in Replicas})
-    /\ UNCHANGED <<globalVars, replicaVars, cViewID, cResps, cWrites, cReads>>
+    /\ UNCHANGED <<globalVars, replicaVars, cViewID, cResps>>
 
-Read(c) ==
-    /\ Sends({[src       |-> c,
-               dest      |-> r,
-               type      |-> MReadRequest,
-               viewID    |-> cViewID[c]] : r \in Replicas})
-    /\ UNCHANGED <<globalVars, replicaVars, cTime, cSeqNum, cResps, cWrites, cReads>>
-
-HandleWriteResponse(c, r, m) ==
+HandleClientResponse(c, r, m) ==
     /\ \/ /\ m.viewID = cViewID[c]
           /\ IF m.seqNum \notin DOMAIN cResps[c][r] THEN
-                cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = cResps[c][r] @@ (m.seqNum :> m)]]
+                cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = cResps[c][r] @@ (m.index :> m)]]
              ELSE
-                cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = [cResps[c][r] EXCEPT ![m.seqNum] = m]]]
+                cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = [cResps[c][r] EXCEPT ![m.index] = m]]]
           /\ LET 
                  allResps    == {cResps[c][r][r1] : r1 \in {r2 \in Replicas : r2 \in DOMAIN cResps[c][r]}}
-                 isCommitted == {r1.src : r1 \in {r2 \in allResps : r2.succeeded}} \in Quorums
+                 succeededResps == {resp \in allResps : resp.viewID = cViewID[c] /\ resp.succeeded}
+                 isCommitted == /\ \E resp \in succeededResps : resp.src = Primary(resp.viewID)
+                                /\ {resp.src : resp \in succeededResps} \in Quorums
              IN
                  /\ \/ /\ isCommitted
-                       /\ cWrites' = [cWrites EXCEPT ![c] = cWrites[c] \cup {m}]
+                       /\ cCommits' = [cCommits EXCEPT ![c] = cCommits[c] \cup {CHOOSE resp \in succeededResps : resp.src = Primary(resp.viewID)}]
                     \/ /\ ~isCommitted
-                       /\ UNCHANGED <<cWrites>>
+                       /\ UNCHANGED <<cCommits>>
                  /\ UNCHANGED <<cViewID, cSeqNum>>
        \/ /\ m.viewID > cViewID[c]
           /\ cViewID' = [cViewID EXCEPT ![c] = m.viewID]
           /\ cSeqNum' = [cSeqNum EXCEPT ![c] = 0]
           /\ cResps'  = [cResps  EXCEPT ![c] = [i \in Replicas |-> {}]]
-          /\ UNCHANGED <<cWrites>>
+          /\ UNCHANGED <<cCommits>>
        \/ /\ m.viewID < cViewID[c]
-          /\ UNCHANGED <<cWrites>>
+          /\ UNCHANGED <<cCommits>>
     /\ Discard(m)
-    /\ UNCHANGED <<globalVars, replicaVars, cTime, cSeqNum, cReads>>
+    /\ UNCHANGED <<globalVars, replicaVars, cTime, cSeqNum>>
 
-HandleReadResponse(c, r, m) ==
-    /\ \/ /\ m.viewID = cViewID[c]
-          /\ cReads' = [cReads EXCEPT ![c] = cReads[c] \cup {m}]
-          /\ UNCHANGED <<cViewID, cSeqNum>>
-       \/ /\ m.viewID > cViewID[c]
-          /\ cViewID' = [cViewID EXCEPT ![c] = m.viewID]
-          /\ cSeqNum' = [cSeqNum EXCEPT ![c] = 0]
-          /\ UNCHANGED <<cReads>>
-       \/ /\ m.viewID < cViewID[c]
-          /\ UNCHANGED <<cViewID, cSeqNum, cReads>>
-    /\ Discard(m)
-    /\ UNCHANGED <<globalVars, replicaVars, cTime, cSeqNum, cResps, cWrites>>
+----
+
+\* Log helpers
+
+ReplaceEntry(l, i, x) == [j \in 1..Max({Len(l), i}) |-> IF j = i THEN x ELSE l[j]]
 
 ----
 
@@ -204,25 +202,30 @@ Abort(r, c, m) ==
                     client |-> c,
                     seqNum |-> m.seqNum] : d \in Replicas})
 
-HandleWriteRequest(r, c, m) ==
+HandleClientRequest(r, c, m) ==
     /\ rStatus[r] = SNormal
     /\ \/ /\ m.viewID = rViewID[r]
           /\ LET
-                 isSequential == m.seqNum = rSeqNum[r][c] + 1
-                 isLinear     == \A i \in DOMAIN rLog[r] : \A e \in rLog[r][i] : m.timestamp > e.timestamp
+                 lastIndex     == Sum({Len(rLog[r][i]) : i \in Clients})
+                 index         == lastIndex + 1
+                 lastTimestamp == rTimestamp[r]
+                 isSequential  == m.seqNum = rSeqNum[r][c] + 1
+                 isLinear      == m.timestamp > lastTimestamp
              IN
                 \/ /\ isSequential
                    /\ isLinear
                    /\ rLog' = [rLog    EXCEPT ![r] = [
                                rLog[r] EXCEPT ![c] = 
                                    Append(rLog[r][c], [type      |-> TValue, 
+                                                       index     |-> index,
                                                        value     |-> m.value,
                                                        timestamp |-> m.timestamp])]]
                    /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![c] = m.seqNum]]
+                   /\ rTimestamp' = [rTimestamp EXCEPT ![r] = m.timestamp]
                    /\ Reply(m, [src       |-> r,
                                 dest      |-> c,
-                                type      |-> MWriteResponse,
-                                seqNum    |-> m.seqNum,
+                                type      |-> MClientResponse,
+                                index     |-> index,
                                 viewID    |-> rViewID[r],
                                 succeeded |-> TRUE])
                 \/ /\ \/ ~isSequential
@@ -232,33 +235,19 @@ HandleWriteRequest(r, c, m) ==
                       \/ /\ ~IsPrimary(r)
                          /\ Reply(m, [src       |-> r,
                                       dest      |-> c,
-                                      type      |-> MWriteResponse,
-                                      seqNum    |-> m.seqNum,
+                                      type      |-> MClientResponse,
+                                      index     |-> index,
                                       viewID    |-> rViewID[r],
                                       succeeded |-> FALSE])
                    /\ UNCHANGED <<rLog>>
        \/ /\ m.viewID < rViewID[r]
           /\ Reply(m, [src       |-> r,
                        dest      |-> c,
-                       type      |-> MWriteResponse,
-                       seqNum    |-> m.seqNum,
+                       type      |-> MClientResponse,
                        viewID    |-> rViewID[r],
                        succeeded |-> FALSE])
           /\ UNCHANGED <<rLog>>
     /\ UNCHANGED <<globalVars, clientVars, rStatus, rViewID, rLastView, rViewChanges>>
-
-HandleReadRequest(r, c, m) ==
-    /\ rStatus[r] = SNormal
-    /\ Len(rLog[r]) > 0
-    /\ Reply(m, [src       |-> r,
-                 dest      |-> c,
-                 type      |-> MReadResponse,
-                 viewID    |-> rViewID[r],
-                 primary   |-> IsPrimary(r),
-                 index     |-> Len(rLog[r]),
-                 checksum  |-> rLog[r][Len(rLog[r])].checksum,
-                 succeeded |-> TRUE])
-    /\ UNCHANGED <<globalVars, clientVars, rStatus, rLog, rViewID, rLastView, rViewChanges>>
 
 HandleRepairRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
@@ -279,7 +268,7 @@ HandleRepairRequest(r, s, m) ==
     /\ UNCHANGED <<globalVars, clientVars>>
 
 HandleRepairResponse(r, s, m) ==
-    /\ HandleWriteRequest(r, m.client, [m EXCEPT !.src = m.client])
+    /\ HandleClientRequest(r, m.client, [m EXCEPT !.src = m.client])
 
 HandleAbortRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
@@ -287,7 +276,7 @@ HandleAbortRequest(r, s, m) ==
     /\ LET index == Len(rLog[r][m.client]) + 1 - (rSeqNum[r] - m.seqNum)
        IN
           /\ index <= Len(rLog[r][m.client]) + 1
-          /\ rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT ![m.client] = Replace(rLog[r][m.client], index, [type |-> TNoOp])]]
+          /\ rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT ![m.client] = ReplaceEntry(rLog[r][m.client], index, [type |-> TNoOp])]]
           /\ \/ /\ m.seqNum > rSeqNum[r][m.client]
                 /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![m.client] = m.seqNum]]
              \/ /\ m.seqNum <= rSeqNum[r][m.client]
@@ -299,7 +288,7 @@ HandleAbortRequest(r, s, m) ==
                           seqNum    |-> m.seqNum],
                          [src       |-> r,
                           dest      |-> Primary(rViewID[r]),
-                          type      |-> MWriteResponse,
+                          type      |-> MClientResponse,
                           viewID    |-> rViewID[r],
                           seqNum    |-> m.seqNum,
                           succeeded |-> FALSE]})
@@ -390,18 +379,18 @@ InitMessageVars ==
     /\ messages = {}
 
 InitClientVars ==
-    /\ cTime      = 0
-    /\ cViewID    = [c \in Clients |-> 1]
-    /\ cSeqNum    = [c \in Clients |-> 0]
-    /\ cResps = [c \in Clients |-> [r \in Replicas |-> [s \in {} |-> [index |-> 0, checksum |-> Nil]]]]
-    /\ cWrites    = [c \in Clients |-> {}]
-    /\ cReads     = [c \in Clients |-> {}]
+    /\ cTime    = 0
+    /\ cViewID  = [c \in Clients |-> 1]
+    /\ cSeqNum  = [c \in Clients |-> 0]
+    /\ cResps   = [c \in Clients |-> [r \in Replicas |-> [s \in {} |-> [index |-> 0, checksum |-> Nil]]]]
+    /\ cCommits = [c \in Clients |-> {}]
 
 InitReplicaVars ==
     /\ replicas     = SeqFromSet(Replicas)
     /\ rStatus      = [r \in Replicas |-> SNormal]
     /\ rLog         = [r \in Replicas |-> [c \in Clients |-> <<>>]]
     /\ rSeqNum      = [r \in Replicas |-> [c \in Clients |-> 0]]
+    /\ rTimestamp   = [r \in Replicas |-> 0]
     /\ rAbortSeqNum = [r \in Replicas |-> [c \in Clients |-> 0]]
     /\ rAbortResps  = [r \in Replicas |-> [c \in Clients |-> {}]]
     /\ rViewID      = [r \in Replicas |-> 1]
@@ -417,7 +406,12 @@ Init ==
 ----
 
 \* The type invariant checks that no read ever reads a different value than a previous write
-Inv == TRUE \* TODO
+Inv ==
+    \A c1, c2 \in Clients :
+       \A e1 \in cCommits[c1] :
+          ~\E e2 \in cCommits[c2] :
+             /\ e1.index = e2.index
+             /\ e1.value # e2.value
 
 Transition == transitions' = transitions + 1
 
@@ -425,27 +419,16 @@ Next ==
     \/ \E c \in Clients :
           /\ Write(c)
           /\ Transition
-    \/ \E c \in Clients : 
-          /\ Read(c)
-          /\ Transition
     \/ \E r \in Replicas : 
           /\ ChangeView(r)
           /\ Transition
     \/ \E m \in messages :
-          /\ m.type = MWriteRequest
-          /\ HandleWriteRequest(m.dest, m.src, m)
+          /\ m.type = MClientRequest
+          /\ HandleClientRequest(m.dest, m.src, m)
           /\ Transition
     \/ \E m \in messages :
-          /\ m.type = MWriteResponse
-          /\ HandleWriteResponse(m.dest, m.src, m)
-          /\ Transition
-    \/ \E m \in messages :
-          /\ m.type = MReadRequest
-          /\ HandleReadRequest(m.dest, m.src, m)
-          /\ Transition
-    \/ \E m \in messages :
-          /\ m.type = MReadResponse
-          /\ HandleReadResponse(m.dest, m.src, m)
+          /\ m.type = MClientResponse
+          /\ HandleClientResponse(m.dest, m.src, m)
           /\ Transition
     \/ \E m \in messages :
           /\ m.type = MRepairRequest
@@ -480,5 +463,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 05:04:13 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 09:53:52 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
