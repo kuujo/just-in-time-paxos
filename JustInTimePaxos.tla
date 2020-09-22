@@ -230,7 +230,12 @@ HandleWriteRequest(r, c, m) ==
                    /\ \/ /\ IsPrimary(r)
                          /\ Abort(r, c, m)
                       \/ /\ ~IsPrimary(r)
-                         /\ Repair(r, c, m)
+                         /\ Reply(m, [src       |-> r,
+                                      dest      |-> c,
+                                      type      |-> MWriteResponse,
+                                      seqNum    |-> m.seqNum,
+                                      viewID    |-> rViewID[r],
+                                      succeeded |-> FALSE])
                    /\ UNCHANGED <<rLog>>
        \/ /\ m.viewID < rViewID[r]
           /\ Reply(m, [src       |-> r,
@@ -259,16 +264,18 @@ HandleRepairRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ IsPrimary(r)
     /\ rStatus[r] = SNormal
-    /\ \/ /\ m.seqNum <= Len(rLog[r][m.client])
-          /\ Reply(m, [src    |-> r,
-                       dest   |-> s,
-                       type   |-> MRepairResponse,
-                       viewID |-> rViewID[r],
-                       client |-> m.client,
-                       seqNum |-> m.seqNum])
-          /\ UNCHANGED <<rStatus, rAbortResps, rAbortSeqNum>>
-       \/ /\ m.seqNum = Len(rLog[r][m.client]) + 1
-          /\ Abort(r, m.client, m)
+    /\ LET index == Len(rLog[r][m.client]) + 1 - (rSeqNum[r] - m.seqNum)
+       IN
+          /\ \/ /\ index <= Len(rLog[r][m.client])
+                /\ Reply(m, [src    |-> r,
+                             dest   |-> s,
+                             type   |-> MRepairResponse,
+                             viewID |-> rViewID[r],
+                             client |-> m.client,
+                             seqNum |-> m.seqNum])
+                /\ UNCHANGED <<rStatus, rAbortResps, rAbortSeqNum>>
+             \/ /\ index = Len(rLog[r][m.client]) + 1
+                /\ Abort(r, m.client, m)
     /\ UNCHANGED <<globalVars, clientVars>>
 
 HandleRepairResponse(r, s, m) ==
@@ -276,24 +283,26 @@ HandleRepairResponse(r, s, m) ==
 
 HandleAbortRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
-    /\ m.seqNum <= Len(rLog[r][m.client]) + 1
-    /\ rStatus[r] \in {SNormal, SAborting} 
-    /\ rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT ![m.client] = Replace(rLog[r][m.client], m.seqNum, [type |-> TNoOp])]]
-    /\ \/ /\ m.seqNum > rSeqNum[r][m.client]
-          /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![m.client] = m.seqNum]]
-       \/ /\ m.seqNum <= rSeqNum[r][m.client]
-          /\ UNCHANGED <<rSeqNum>>
-    /\ Replies(m, {[src       |-> r,
-                    dest      |-> Primary(rViewID[r]),
-                    type      |-> MAbortResponse,
-                    viewID    |-> rViewID[r],
-                    seqNum    |-> m.seqNum],
-                   [src       |-> r,
-                    dest      |-> Primary(rViewID[r]),
-                    type      |-> MWriteResponse,
-                    viewID    |-> rViewID[r],
-                    seqNum    |-> m.seqNum,
-                    succeeded |-> FALSE]})
+    /\ rStatus[r] \in {SNormal, SAborting}
+    /\ LET index == Len(rLog[r][m.client]) + 1 - (rSeqNum[r] - m.seqNum)
+       IN
+          /\ index <= Len(rLog[r][m.client]) + 1
+          /\ rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT ![m.client] = Replace(rLog[r][m.client], index, [type |-> TNoOp])]]
+          /\ \/ /\ m.seqNum > rSeqNum[r][m.client]
+                /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![m.client] = m.seqNum]]
+             \/ /\ m.seqNum <= rSeqNum[r][m.client]
+                /\ UNCHANGED <<rSeqNum>>
+          /\ Replies(m, {[src       |-> r,
+                          dest      |-> Primary(rViewID[r]),
+                          type      |-> MAbortResponse,
+                          viewID    |-> rViewID[r],
+                          seqNum    |-> m.seqNum],
+                         [src       |-> r,
+                          dest      |-> Primary(rViewID[r]),
+                          type      |-> MWriteResponse,
+                          viewID    |-> rViewID[r],
+                          seqNum    |-> m.seqNum,
+                          succeeded |-> FALSE]})
     /\ UNCHANGED <<globalVars, clientVars, rStatus, rViewID, rLastView, rViewChanges>>
 
 HandleAbortResponse(r, s, m) ==
@@ -471,5 +480,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 04:25:22 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 05:04:13 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
