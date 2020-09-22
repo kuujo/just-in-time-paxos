@@ -65,9 +65,9 @@ VARIABLE viewID
 
 VARIABLE lastNormalView
 
-VARIABLE viewChangeResponses
+VARIABLE viewChanges
 
-replicaVars == <<status, log, viewID, lastNormalView, viewChangeResponses>>
+replicaVars == <<status, log, viewID, lastNormalView, viewChanges>>
 
 VARIABLE transitions
 
@@ -101,9 +101,9 @@ Sends(ms) == messages' = messages \cup ms
 
 Send(m) == Sends({m})
 
-Replies(reqs, resps) == messages' = (messages \cup resps) \ reqs
+Replies(req, resps) == messages' = (messages \cup resps) \ {req}
 
-Reply(req, resp) == Replies({req}, {resp})
+Reply(req, resp) == Replies(req, {resp})
 
 Discard(m) == messages' = messages \ {m}
 
@@ -210,7 +210,7 @@ HandleWriteRequest(r, c, m) ==
                        checksum  |-> log[r][Len(log[r])].checksum,
                        succeeded |-> FALSE])
           /\ UNCHANGED <<log>>
-    /\ UNCHANGED <<globalVars, clientVars, status, viewID, lastNormalView, viewChangeResponses>>
+    /\ UNCHANGED <<globalVars, clientVars, status, viewID, lastNormalView, viewChanges>>
 
 HandleReadRequest(r, c, m) ==
     /\ status[r] = NormalStatus
@@ -224,28 +224,22 @@ HandleReadRequest(r, c, m) ==
                  index     |-> Len(log[r]),
                  checksum  |-> log[r][Len(log[r])].checksum,
                  succeeded |-> TRUE])
-    /\ UNCHANGED <<globalVars, clientVars, status, log, viewID, lastNormalView, viewChangeResponses>>
+    /\ UNCHANGED <<globalVars, clientVars, status, log, viewID, lastNormalView, viewChanges>>
 
 ChangeView(r) ==
-    LET nextViewID == viewID[r] + 1
-    IN
-       /\ Primary(nextViewID) = r
-       /\ status' = [status EXCEPT ![r] = ViewChangeStatus]
-       /\ viewID' = [viewID EXCEPT ![r] = nextViewID]
-       /\ viewChangeResponses' = [viewChangeResponses EXCEPT ![r] = {}]
-       /\ Sends({[src    |-> r,
-                  dest   |-> d,
-                  type   |-> ViewChangeRequest,
-                  viewID |-> nextViewID] : d \in Replicas})
-       /\ UNCHANGED <<globalVars, clientVars, log, lastNormalView>>
+    /\ Sends({[src    |-> r,
+               dest   |-> d,
+               type   |-> ViewChangeRequest,
+               viewID |-> viewID[r] + 1] : d \in Replicas})
+    /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
 
 HandleViewChangeRequest(r, s, m) ==
-    /\ viewID[r] # m.viewID
-    /\ viewID' = [viewID EXCEPT ![r] = m.viewID]
-    /\ status' = [status EXCEPT ![r] = ViewChangeStatus]
-    /\ viewChangeResponses' = [viewChangeResponses EXCEPT ![r] = {}]
+    /\ viewID[r] < m.viewID
+    /\ viewID'      = [viewID EXCEPT ![r] = m.viewID]
+    /\ status'      = [status EXCEPT ![r] = ViewChangeStatus]
+    /\ viewChanges' = [viewChanges EXCEPT ![r] = {}]
     /\ Reply(m, [src        |-> r,
-                 dest       |-> s,
+                 dest       |-> Primary(m.viewID),
                  type       |-> ViewChangeResponse,
                  viewID     |-> m.viewID,
                  lastNormal |-> lastNormalView[r],
@@ -253,36 +247,37 @@ HandleViewChangeRequest(r, s, m) ==
     /\ UNCHANGED <<globalVars, clientVars, log, lastNormalView>>
 
 HandleViewChangeResponse(r, s, m) ==
-    /\ viewID[r] = m.viewID
-    /\ status[r] = ViewChangeStatus
     /\ IsPrimary(r)
-    /\ viewChangeResponses' = [viewChangeResponses EXCEPT ![r] = viewChangeResponses[r] \cup {m}]
+    /\ viewID[r]    = m.viewID
+    /\ status[r]    = ViewChangeStatus
+    /\ viewChanges' = [viewChanges EXCEPT ![r] = viewChanges[r] \cup {m}]
     /\ LET
           isViewQuorum(vs) == IsQuorum(vs) /\ \E v \in vs : v.src = r
-          viewChanges == {n \in viewChangeResponses[r] : n.type = ViewChangeResponse /\ n.viewID = viewID[r]}
-          normalViews == {n.lastNormal : n \in viewChanges}
-          lastNormal == {CHOOSE v \in normalViews : \A v2 \in normalViews : v2 < v}
-          goodLogs == {n.log : n \in {o \in viewChanges : o.lastNormal = lastNormal}}
+          newViewChanges == {v \in viewChanges'[r] : v.viewID = viewID[r]}
+          normalViews == {v.lastNormal : v \in newViewChanges}
+          lastNormal == CHOOSE v \in normalViews : \A v2 \in normalViews : v2 <= v
+          goodLogs == {n.log : n \in {v \in newViewChanges : v.lastNormal = lastNormal}}
           combineLogs(ls) ==
              LET 
-                logsWith(i) == {l \in ls : Len(l) >= i}
-                entries(i) == {l[i] : l \in logsWith(i)}
-                quorums(i) == {l \in SUBSET logsWith(i) : IsQuorum(l)}
+                logsWith(i)     == {l \in ls : Len(l) >= i}
+                entries(i)      == {l[i] : l \in logsWith(i)}
+                quorums(i)      == {l \in SUBSET logsWith(i) : IsQuorum(l)}
                 checksums(l, i) == {e.checksum : e \in l[i]}
-                isCommitted(i) == \E e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
-                committed(i) == CHOOSE e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
-                maxIndex == Max({Len(l) : l \in ls})
-                maxCommitted == Max({i \in 1..maxIndex : isCommitted(i)})
+                isCommitted(i)  == \E e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
+                entry(i)        == CHOOSE e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
+                maxIndex        == Max({Len(l) : l \in ls})
+                commits         == {i \in 1..maxIndex : isCommitted(i)}
+                maxCommit       == IF Cardinality(commits) > 0 THEN Max(commits) ELSE 0
              IN
-                [i \in 1..maxCommitted |-> committed(i)]
+                [i \in 1..maxCommit |-> entry(i)]
        IN
-          \/ /\ isViewQuorum(viewChanges)
+          \/ /\ isViewQuorum(newViewChanges)
              /\ Replies(m, {[src    |-> r,
                              dest   |-> d,
                              type   |-> StartViewRequest,
                              viewID |-> viewID[r],
                              log    |-> combineLogs(goodLogs)] : d \in Replicas})
-          \/ /\ ~isViewQuorum(viewChanges)
+          \/ /\ ~isViewQuorum(newViewChanges)
              /\ Discard(m)
     /\ UNCHANGED <<globalVars, clientVars, status, viewID, log, lastNormalView>>
 
@@ -290,12 +285,12 @@ HandleStartViewRequest(r, s, m) ==
     /\ \/ viewID[r] < m.viewID
        \/ /\ viewID[r] = m.viewID
           /\ status[r] = ViewChangeStatus
-    /\ log'    = [log EXCEPT ![r] = m.log]
-    /\ status' = [status EXCEPT ![r] = NormalStatus]
-    /\ viewID' = [viewID EXCEPT ![r] = m.viewID]
+    /\ log'            = [log EXCEPT ![r] = m.log]
+    /\ status'         = [status EXCEPT ![r] = NormalStatus]
+    /\ viewID'         = [viewID EXCEPT ![r] = m.viewID]
     /\ lastNormalView' = [lastNormalView EXCEPT ![r] = m.viewID]
     /\ Discard(m)
-    /\ UNCHANGED <<globalVars, clientVars, viewChangeResponses>>
+    /\ UNCHANGED <<globalVars, clientVars, viewChanges>>
 
 ----
 
@@ -305,19 +300,19 @@ InitMessageVars ==
 
 InitClientVars ==
     /\ globalTime = 0
-    /\ time = [c \in Clients |-> 0]
-    /\ requestID = [c \in Clients |-> 0]
-    /\ responses = [c \in Clients |-> [r \in Replicas |-> [s \in {} |-> [index |-> 0, checksum |-> Nil]]]]
-    /\ writes = [c \in Clients |-> {}]
-    /\ reads = [c \in Clients |-> {}]
+    /\ time       = [c \in Clients |-> 0]
+    /\ requestID  = [c \in Clients |-> 0]
+    /\ responses  = [c \in Clients |-> [r \in Replicas |-> [s \in {} |-> [index |-> 0, checksum |-> Nil]]]]
+    /\ writes     = [c \in Clients |-> {}]
+    /\ reads      = [c \in Clients |-> {}]
 
 InitReplicaVars ==
-    /\ replicas = SeqFromSet(Replicas)
-    /\ status = [r \in Replicas |-> NormalStatus]
-    /\ log = [r \in Replicas |-> <<>>]
-    /\ viewID = [r \in Replicas |-> 1]
+    /\ replicas       = SeqFromSet(Replicas)
+    /\ status         = [r \in Replicas |-> NormalStatus]
+    /\ log            = [r \in Replicas |-> <<>>]
+    /\ viewID         = [r \in Replicas |-> 1]
     /\ lastNormalView = [r \in Replicas |-> 1]
-    /\ viewChangeResponses = [r \in Replicas |-> {}]
+    /\ viewChanges    = [r \in Replicas |-> {}]
 
 Init ==
     /\ InitMessageVars
@@ -385,5 +380,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Mon Sep 21 15:12:31 PDT 2020 by jordanhalterman
+\* Last modified Mon Sep 21 17:36:58 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
