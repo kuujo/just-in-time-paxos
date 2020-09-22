@@ -34,6 +34,11 @@ CONSTANTS
     SAborting,
     SViewChange
 
+\* Entry types
+CONSTANTS
+    TValue,
+    TNoOp,
+
 ----
 
 VARIABLE replicas
@@ -202,7 +207,8 @@ HandleWriteRequest(r, c, m) ==
     /\ rStatus[r] = SNormal
     /\ \/ /\ m.viewID = rViewID[r]
           /\ m.seqNum = rSeqNum[r][c] + 1
-          /\ rLog' = [rLog EXCEPT ![r] = Append(rLog[r], m)]
+          /\ LET entry == [type |-> TValue, value |-> m.value, timestamp |-> m.timestamp]
+             IN  rLog' = [rLog EXCEPT ![r] = Append(rLog[r], entry)]
           /\ rSeqNum' = [rSeqNum EXCEPT ![r] = m.seqNum]
           /\ Reply(m, [src       |-> r,
                        dest      |-> c,
@@ -263,7 +269,8 @@ HandleAbortRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ m.seqNum <= Len(rLog[r][m.client]) + 1
     /\ rStatus[r] \in {SNormal, SAborting} 
-    /\ rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT ![m.client] = Replace(rLog[r][m.client], m.seqNum, Nil)]]
+    /\ LET entry == [type |-> TNoOp]
+       IN rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT ![m.client] = Replace(rLog[r][m.client], m.seqNum, entry)]]
     /\ \/ /\ m.seqNum > rSeqNum[r][m.client]
           /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![m.client] = m.seqNum]]
        \/ /\ m.seqNum <= rSeqNum[r][m.client]
@@ -314,54 +321,47 @@ HandleViewChangeRequest(r, s, m) ==
                  dest       |-> Primary(m.viewID),
                  type       |-> MViewChangeResponse,
                  viewID     |-> m.viewID,
-                 lastNormal |-> rLastView[r],
-                 log        |-> rLog[r]])
-    /\ UNCHANGED <<globalVars, clientVars, rLog, rLastView>>
+                 lastViewID |-> rLastView[r],
+                 logs       |-> rLog[r]])
+    /\ UNCHANGED <<globalVars, clientVars, rLog, rSeqNum, rAbortSeqNum, rAbortResps, rLastView>>
 
 HandleViewChangeResponse(r, s, m) ==
     /\ IsPrimary(r)
     /\ rViewID[r]    = m.viewID
     /\ rStatus[r]    = SViewChange
     /\ rViewChanges' = [rViewChanges EXCEPT ![r] = rViewChanges[r] \cup {m}]
-    /\ LET
-          isViewQuorum(vs) == IsQuorum(vs) /\ \E v \in vs : v.src = r
-          newViewChanges   == {v \in rViewChanges'[r] : v.viewID = rViewID[r]}
-          normalViews      == {v.lastNormal : v \in newViewChanges}
-          lastNormal       == CHOOSE v \in normalViews : \A v2 \in normalViews : v2 <= v
-          goodLogs         == {n.log : n \in {v \in newViewChanges : v.lastNormal = lastNormal}}
-          combineLogs(ls)  ==
-             LET 
-                indexLogs(i)           == {l \in ls : Len(l) >= i}
-                indexEntries(i)        == {l[i] : l \in indexLogs(i)}
-                quorumLogs(i)          == {L \in SUBSET indexLogs(i) : IsQuorum(L)}
-                isCommittedEntry(i, e) == \A L \in quorumLogs(i) :
-                                             \E l \in L : 
-                                                ChecksumsMatch(e.checksum, l[i].checksum)
-                isCommittedIndex(i)    == \E e \in indexEntries(i) : isCommittedEntry(i, e)
-                commit(i)              == CHOOSE e \in indexEntries(i) : isCommittedEntry(i, e)
-                maxIndex               == Max({Len(l) : l \in ls})
-                committedIndexes       == {i \in 1..maxIndex : isCommittedIndex(i)}
-                maxCommit              == IF Cardinality(committedIndexes) > 0 THEN Max(committedIndexes) ELSE 0
-             IN
-                [i \in 1..maxCommit |-> commit(i)]
+    /\ LET viewChanges    == {v \in rViewChanges'[r][m.client] : /\ v.viewID = rViewID[r]}
+           viewSources    == {v.src : v \in viewChanges}
+           isQuorum       == r \in viewSources /\ viewSources \in Quorums
+           lastViews      == {v.lastViewID : v \in viewChanges}
+           lastView       == (CHOOSE v1 \in lastViews : \A v2 \in lastViews : v2 <= v1)
+           viewLogs       == [c \in Clients |-> {v1.logs[c] : v1 \in {v2 \in viewChanges : v2.lastView = lastView}}]
+           mergeEnts(es)  ==
+               IF es = {} \/ \E e \in es : r.type = TNoOp THEN
+                   [type |-> TNoOp]
+               ELSE
+                   CHOOSE e \in es : e.type # TNoOp
+           range(ls)      == Max({Len(l) : l \in ls})
+           entries(ls, i) == {l[i] : l \in {k \in ls : i <= Len(k)}}
+           mergeLogs(ls)  == [i \in 1..range(ls) |-> mergeEnts(entries(ls, i))]
        IN
-          \/ /\ isViewQuorum(newViewChanges)
-             /\ Replies(m, {[src    |-> r,
-                             dest   |-> d,
-                             type   |-> MStartViewRequest,
-                             viewID |-> rViewID[r],
-                             log    |-> combineLogs(goodLogs)] : d \in Replicas})
-          \/ /\ ~isViewQuorum(newViewChanges)
-             /\ Discard(m)
-    /\ UNCHANGED <<globalVars, clientVars, rStatus, rViewID, rLog, rLastView>>
+           \/ /\ isQuorum
+              /\ Replies(m, {[src    |-> r,
+                              dest   |-> d,
+                              type   |-> MStartViewRequest,
+                              viewID |-> rViewID[r],
+                              logs   |-> [c \in Clients |-> mergeLogs(viewLogs[c])]] : d \in Replicas})
+           \/ /\ ~isQuorum
+              /\ Discard(m)
+    /\ UNCHANGED <<globalVars, clientVars, rStatus, rViewID, rLog, rSeqNum, rAbortSeqNum, rAbortResps, rLastView>>
 
 HandleStartViewRequest(r, s, m) ==
     /\ \/ rViewID[r] < m.viewID
        \/ /\ rViewID[r] = m.viewID
           /\ rStatus[r] = SViewChange
-    /\ rLog'            = [rLog EXCEPT ![r] = m.log]
-    /\ rStatus'         = [rStatus EXCEPT ![r] = SNormal]
-    /\ rViewID'         = [rViewID EXCEPT ![r] = m.viewID]
+    /\ rLog'      = [rLog      EXCEPT ![r] = m.log]
+    /\ rStatus'   = [rStatus   EXCEPT ![r] = SNormal]
+    /\ rViewID'   = [rViewID   EXCEPT ![r] = m.viewID]
     /\ rLastView' = [rLastView EXCEPT ![r] = m.viewID]
     /\ Discard(m)
     /\ UNCHANGED <<globalVars, clientVars, rViewChanges>>
@@ -473,5 +473,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 03:02:49 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 03:38:33 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
