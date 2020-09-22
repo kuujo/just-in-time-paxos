@@ -37,6 +37,91 @@ CONSTANTS
     TValue,
     TNoOp
 
+(*
+Message schemas
+
+ViewIDs == [viewID |-> n \in (1..)]
+
+  ClientRequest
+    [src       |-> c \in Clients,
+     dest      |-> r \in Replicas,
+     type      |-> MClientRequest,
+     viewID    |-> i \in ViewIDs,
+     sessionID |-> c \in Clients,
+     value     |-> v \in Values,
+     seqNum    |-> s \in (1..),
+     timestamp |-> t \in (1..)]
+
+  ClientResponse
+    [src       |-> r \in Replicas,
+     dest      |-> c \in Clients,
+     type      |-> MClientResponse,
+     viewID    |-> i \in ViewIDs,
+     sessionID |-> c \in Clients,
+     value     |-> v \in Values,
+     seqNum    |-> s \in (1..),
+     index     |-> i \in (1..),
+     succeeded |-> TRUE \/ FALSE]
+
+  RepairRequest
+    [src       |-> r \in Replicas,
+     dest      |-> r \in Replicas,
+     type      |-> MRepairRequest,
+     viewID    |-> i \in ViewIDs,
+     sessionID |-> c \in Clients,
+     seqNum    |-> s \in (1..),
+     timestamp |-> t \in (1..)]
+
+  RepairResponse
+    [src       |-> r \in Replicas,
+     dest      |-> r \in Replicas,
+     type      |-> MRepairResponse,
+     viewID    |-> i \in ViewIDs,
+     sessionID |-> c \in Clients,
+     seqNum    |-> s \in (1..),
+     value     |-> v \in Values,
+     timestamp |-> t \in (1..)]
+
+  AbortRequest
+    [src       |-> r \in Replicas,
+     dest      |-> r \in Replicas,
+     type      |-> MAbortRequest,
+     viewID    |-> i \in ViewIDs,
+     sessionID |-> c \in Clients,
+     seqNum    |-> s \in (1..),
+     timestamp |-> t \in (1..)]
+
+  AbortResponse
+    [src       |-> r \in Replicas,
+     dest      |-> r \in Replicas,
+     type      |-> MAbortResponse,
+     viewID    |-> i \in ViewIDs,
+     sessionID |-> c \in Clients,
+     seqNum    |-> s \in (1..)]
+
+  ViewChangeRequest
+    [src        |-> r \in Replicas,
+     dest       |-> r \in Replicas,
+     type       |-> MViewChangeRequest,
+     viewID     |-> i \in ViewIDs]
+  
+  ViewChangeResponse
+    [src        |-> r \in Replicas,
+     dest       |-> r \in Replicas,
+     type       |-> MViewChangeResponse,
+     viewID     |-> i \in ViewIDs,
+     lastViewID |-> i \in (1..),
+     logs       |-> [c \in Clients |-> <<>>]]
+  
+  StartViewRequest
+    [src       |-> r \in Replicas,
+     dest      |-> r \in Replicas,
+     type      |-> MStartViewRequest,
+     viewID    |-> i \in ViewIDs,
+     timestamp |-> t \in (1..),
+     log       |-> [c \in Clients |-> <<>>]]
+*)
+
 ----
 
 \* A sequence of replicas used for deterministic primary election
@@ -166,6 +251,13 @@ This section models client requests.
 *)
 
 \* Client 'c' sends value 'v' to all replicas
+\* Client requests are ordered globally using physical timestamps and locally (within
+\* the client) using client sequence numbers. Sequence numbers are sequential and unique
+\* within each view.
+\* When the client sends a request is generates a new timestamp. Physical timestamps
+\* are modeled here as a strictly increasing global clock simulating synchronized 
+\* system clocks. The sequence number for the client is also incremented and sent
+\* with the request.
 ClientRequest(c, v) ==
     /\ cTime' = cTime + 1
     /\ cSeqNum' = [cSeqNum EXCEPT ![c] = cSeqNum[c] + 1]
@@ -179,6 +271,11 @@ ClientRequest(c, v) ==
     /\ UNCHANGED <<globalVars, replicaVars, cViewID, cResps, cCommits>>
 
 \* Client 'c' handles a response 'm' from replica 'r'
+\* When a response is received by the client, if the client is still in the request
+\* view it can process the response. The client is responsible for determining commitment
+\* by counting responses for each sequence number. Once a response is received from a
+\* majority of the replicas including the primary replica, the response is committed.
+\* Committed responses are stored in a history variable for checking against invariants.
 HandleClientResponse(c, r, m) ==
     /\ \/ /\ m.viewID = cViewID[c]
           /\ cResps' = [cResps EXCEPT ![c] = cResps[c] \cup {m}]
@@ -216,7 +313,7 @@ Repair(r, c, m) ==
                     dest      |-> d,
                     type      |-> MRepairRequest,
                     viewID    |-> rViewID[r],
-                    client    |-> c,
+                    sessionID |-> c,
                     seqNum    |-> m.seqNum,
                     timestamp |-> m.timestamp] : d \in Replicas})
 
@@ -226,16 +323,32 @@ Abort(r, c, m) ==
     /\ rStatus[r]   = SNormal
     /\ rStatus'     = [rStatus     EXCEPT ![r] = SAborting]
     /\ rAbortResps' = [rAbortResps EXCEPT ![r] = {}]
-    /\ rAbortPoint' = [rAbortPoint EXCEPT ![r] = [client |-> c, seqNum |-> m.seqNum]]
+    /\ rAbortPoint' = [rAbortPoint EXCEPT ![r] = [sessionID |-> c, seqNum |-> m.seqNum]]
     /\ Replies(m, {[src       |-> r,
                     dest      |-> d,
                     type      |-> MAbortRequest,
                     viewID    |-> rViewID[r],
-                    client    |-> c,
+                    sessionID |-> c,
                     seqNum    |-> m.seqNum,
                     timestamp |-> m.timestamp] : d \in Replicas})
 
 \* Replica 'r' handles client 'c' request 'm'
+\* Client requests with a view ID not matching the replica's view are rejected.
+\* Clients reset their sequence number of 
+\* For requests in the correct view, the request must be sequential and linear
+\* to be appended to the log. That is, the request must have a 'seqNum' that is
+\* 1 + the prior 'seqNum' for the client, and the 'timestamp' must be greater
+\* than all prior timestamps in the log. This is necessary to ensure the primary
+\* log does not change when requests are reordered. The client can retry requests
+\* that are reordered with a new sequence number and timestamp.
+\* To maintain consistency within the log, a separate sequence is maintained for
+\* each session (client), and each sequence number is assigned to a unique
+\* position in the session log. Session logs are logically merged into a totally
+\* ordered log using the request timestamps.
+\* When a sequence number is skipped, the primary must commit a TNoOp entry to
+\* the log. It does so by running the AbortRequest protocol.
+\* When a sequence number is skipped on a non-primary replica, the replica attempts
+\* to recover the request using the RepairRequest protocol.
 HandleClientRequest(r, c, m) ==
     /\ rStatus[r] = SNormal
     /\ \/ /\ m.viewID = rViewID[r]
@@ -255,7 +368,6 @@ HandleClientRequest(r, c, m) ==
                 \/ /\ isSequential
                    /\ isLinear
                    /\ rLog'       = append(entry)
-                   /\ rSeqNum'    = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![c] = m.seqNum]]
                    /\ rTimestamp' = [rTimestamp EXCEPT ![r] = m.timestamp]
                    /\ Reply(m, [src       |-> r,
                                 dest      |-> c,
@@ -286,53 +398,58 @@ HandleClientRequest(r, c, m) ==
     /\ UNCHANGED <<globalVars, clientVars, rViewID, rLastViewID, rViewChanges>>
 
 \* Replica 'r' handles replica 's' repair request 'm'
+\* When a repair request is received, if the requested sequence number is in the session
+\* log, the entry is returned. Otherwise, the primary aborts the request.
 HandleRepairRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ IsPrimary(r)
     /\ rStatus[r] = SNormal
-    /\ LET offset == Len(rLog[r][m.client]) - (rSeqNum[r][m.client] - m.seqNum)
+    /\ LET offset == Len(rLog[r][m.sessionID]) - (rSeqNum[r][m.sessionID] - m.seqNum)
        IN
-          \/ /\ offset <= Len(rLog[r][m.client])
+          \/ /\ offset <= Len(rLog[r][m.sessionID])
              /\ Reply(m, [src       |-> r,
                           dest      |-> s,
                           type      |-> MRepairResponse,
                           viewID    |-> rViewID[r],
-                          client    |-> m.client,
+                          sessionID |-> m.sessionID,
                           seqNum    |-> m.seqNum,
-                          value     |-> rLog[r][m.client][offset].value,
-                          timestamp |-> rLog[r][m.client][offset].timestamp])
+                          value     |-> rLog[r][m.sessionID][offset].value,
+                          timestamp |-> rLog[r][m.sessionID][offset].timestamp])
              /\ UNCHANGED <<rStatus, rAbortPoint, rAbortResps>>
-          \/ /\ offset = Len(rLog[r][m.client]) + 1
-             /\ Abort(r, m.client, m)
+          \/ /\ offset = Len(rLog[r][m.sessionID]) + 1
+             /\ Abort(r, m.sessionID, m)
     /\ UNCHANGED <<globalVars, clientVars, rLog, rSeqNum, rTimestamp, rViewID, rLastViewID, rViewChanges>>
 
 \* Replica 'r' handles replica 's' repair response 'm'
+\* Repair responses are handled like client requests.
 HandleRepairResponse(r, s, m) ==
-    /\ HandleClientRequest(r, m.client, [m EXCEPT !.src = m.client])
+    HandleClientRequest(r, m.sessionID, [m EXCEPT !.src = m.sessionID])
 
 \* Replica 'r' handles replica 's' abort request 'm'
+\* If the aborted sequence number is in the session log, the entry is replaced with
+\* a no-op entry. If the sequence number can be appebded to the log, it is.
 HandleAbortRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ rStatus[r] \in {SNormal, SAborting}
     /\ LET 
-           offset == Len(rLog[r][m.client]) - (rSeqNum[r][m.client] - m.seqNum)
-           entry == [type |-> TNoOp, timestamp |-> m.timestamp]
+           offset           == Len(rLog[r][m.sessionID]) - (rSeqNum[r][m.sessionID] - m.seqNum)
+           entry            == [type |-> TNoOp, timestamp |-> m.timestamp]
            replace(l, i, e) == [j \in 1..Max({Len(l), i}) |-> IF j = i THEN e ELSE l[j]]
        IN
-          /\ offset <= Len(rLog[r][m.client]) + 1
+          /\ offset <= Len(rLog[r][m.sessionID]) + 1
           /\ rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT 
-                                  ![m.client] = replace(rLog[r][m.client], offset, entry)]]
+                                  ![m.sessionID] = replace(rLog[r][m.sessionID], offset, entry)]]
           /\ rTimestamp' = [rTimestamp EXCEPT ![r] = Max({rTimestamp[r], m.timestamp})]
           /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT 
-                                        ![m.client] = Max({rSeqNum[r][m.client], m.seqNum})]]
+                                        ![m.sessionID] = Max({rSeqNum[r][m.sessionID], m.seqNum})]]
           /\ Replies(m, {[src       |-> r,
                           dest      |-> Primary(rViewID[r]),
                           type      |-> MAbortResponse,
                           viewID    |-> rViewID[r],
-                          client    |-> m.client,
+                          sessionID |-> m.sessionID,
                           seqNum    |-> m.seqNum],
                          [src       |-> r,
-                          dest      |-> m.client,
+                          dest      |-> m.sessionID,
                           type      |-> MClientResponse,
                           viewID    |-> rViewID[r],
                           seqNum    |-> m.seqNum,
@@ -348,9 +465,9 @@ HandleAbortResponse(r, s, m) ==
     /\ m.seqNum = rAbortPoint[r].seqNum
     /\ rAbortResps' = [rAbortResps EXCEPT ![r] = rAbortResps[r] \cup {m}]
     /\ LET resps == {res.src : res \in {resp \in rAbortResps'[r] :
-                        /\ resp.viewID = rViewID[r]
-                        /\ resp.client = rAbortPoint[r].client
-                        /\ resp.seqNum = rAbortPoint[r].seqNum}}
+                        /\ resp.viewID    = rViewID[r]
+                        /\ resp.sessionID = rAbortPoint[r].sessionID
+                        /\ resp.seqNum    = rAbortPoint[r].seqNum}}
            isQuorum == r \in resps /\ resps \in Quorums
        IN
           \/ /\ isQuorum
@@ -361,6 +478,7 @@ HandleAbortResponse(r, s, m) ==
                    rAbortPoint, rViewID, rViewChanges, rLastViewID>>
 
 \* Replica 'r' requests a view change
+\* The view change is requested by sending a ViewChangeRequest to each replica.
 ChangeView(r) ==
     /\ Sends({[src    |-> r,
                dest   |-> d,
@@ -369,6 +487,10 @@ ChangeView(r) ==
     /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
 
 \* Replica 'r' handles replica 's' view change request 'm'
+\* Replicas respond to ViewChangeRequests with the contents of their logs
+\* for reconciliation. When a new view change is requested, the replica updates
+\* its ViewID and transitions to the ViewChange status to block writes during
+\* the transition.
 HandleViewChangeRequest(r, s, m) ==
     /\ rViewID[r] < m.viewID
     /\ rViewID'      = [rViewID EXCEPT ![r] = m.viewID]
@@ -384,6 +506,13 @@ HandleViewChangeRequest(r, s, m) ==
                    rAbortPoint, rAbortResps, rLastViewID>>
 
 \* Replica 'r' handles replica 's' view change response 'm'
+\* ViewChangeResponses are handled by the primary for the new view. Once
+\* responses are received from a majority of the replicas including the new
+\* primary, the logs received from each replica are merged together to form
+\* the log for the new view. For each known session, the logs from each replica
+\* are merged by comparing each entry and keeping all non-empty sequential
+\* entries in the quorum. An updated timestamp is calculated from the reconciled
+\* log, and a StartViewRequest containing the new logs is sent to each replica.
 HandleViewChangeResponse(r, s, m) ==
     /\ IsPrimary(r)
     /\ rViewID[r]    = m.viewID
@@ -424,6 +553,7 @@ HandleViewChangeResponse(r, s, m) ==
                    rTimestamp, rAbortPoint, rAbortResps, rLastViewID>>
 
 \* Replica 'r' handles replica 's' start view request 'm'
+\* If the view is new, the replica updates its logs and session state from the request.
 HandleStartViewRequest(r, s, m) ==
     /\ \/ rViewID[r] < m.viewID
        \/ /\ rViewID[r] = m.viewID
@@ -519,5 +649,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 14:18:02 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 15:08:43 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
