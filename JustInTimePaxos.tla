@@ -37,7 +37,7 @@ CONSTANTS
 \* Entry types
 CONSTANTS
     TValue,
-    TNoOp,
+    TNoOp
 
 ----
 
@@ -141,40 +141,41 @@ Read(c) ==
                viewID    |-> cViewID[c]] : r \in Replicas})
     /\ UNCHANGED <<globalVars, replicaVars, cTime, cSeqNum, cResps, cWrites, cReads>>
 
-ChecksumsMatch(c1, c2) ==
-    /\ Len(c1) = Len(c2)
-    /\ ~\E i \in DOMAIN c1 : c1[i] # c2[i]
-
-IsCommitted(acks) ==
-    \E msgs \in SUBSET acks :
-       /\ {m.src    : m \in msgs} \in Quorums
-       /\ \E m1 \in msgs : \A m2 \in msgs : m1.viewID = m2.viewID /\ ChecksumsMatch(m1.checksum, m2.checksum)
-       /\ \E m \in msgs : m.primary
-
 HandleWriteResponse(c, r, m) ==
-    /\ ~\E w \in cWrites[c] : w.seqNum = m.seqNum
-    /\ \/ /\ m.seqNum \notin DOMAIN cResps[c][r]
-          /\ cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = cResps[c][r] @@ (m.seqNum :> m)]]
-          /\ UNCHANGED <<cWrites>>
-       \/ /\ m.seqNum \in DOMAIN cResps[c][r]
-          \* Do not overwrite a response from a newer view
-          /\ cResps[c][r][m.seqNum].viewID <= m.viewID
-          /\ cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = [cResps[c][r] EXCEPT ![m.seqNum] = m]]]
-          /\ LET committed == IsCommitted({cResps'[c][x][m.seqNum] : x \in {x \in Replicas : m.seqNum \in DOMAIN cResps'[c][x]}})
+    /\ \/ /\ m.viewID = cViewID[c]
+          /\ IF m.seqNum \notin DOMAIN cResps[c][r] THEN
+                cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = cResps[c][r] @@ (m.seqNum :> m)]]
+             ELSE
+                cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = [cResps[c][r] EXCEPT ![m.seqNum] = m]]]
+          /\ LET 
+                 allResps    == {cResps[c][r][r1] : r1 \in {r2 \in Replicas : r2 \in DOMAIN cResps[c][r]}}
+                 isCommitted == {r1.src : r1 \in {r2 \in allResps : r2.succeeded}} \in Quorums
              IN
-                \/ /\ committed
-                   /\ cWrites' = [cWrites EXCEPT ![c] = cWrites[c] \cup {m}]
-                \/ /\ ~committed
-                   /\ UNCHANGED <<cWrites>>
+                 /\ \/ /\ isCommitted
+                       /\ cWrites' = [cWrites EXCEPT ![c] = cWrites[c] \cup {m}]
+                    \/ /\ ~isCommitted
+                       /\ UNCHANGED <<cWrites>>
+                 /\ UNCHANGED <<cViewID, cSeqNum>>
+       \/ /\ m.viewID > cViewID[c]
+          /\ cViewID' = [cViewID EXCEPT ![c] = m.viewID]
+          /\ cSeqNum' = [cSeqNum EXCEPT ![c] = 0]
+          /\ cResps'  = [cResps  EXCEPT ![c] = [i \in Replicas |-> {}]]
+          /\ UNCHANGED <<cWrites>>
+       \/ /\ m.viewID < cViewID[c]
+          /\ UNCHANGED <<cWrites>>
     /\ Discard(m)
     /\ UNCHANGED <<globalVars, replicaVars, cTime, cSeqNum, cReads>>
 
 HandleReadResponse(c, r, m) ==
-    /\ \/ /\ m.primary
-          /\ m \notin cReads[c]
+    /\ \/ /\ m.viewID = cViewID[c]
           /\ cReads' = [cReads EXCEPT ![c] = cReads[c] \cup {m}]
-       \/ /\ ~m.primary
+          /\ UNCHANGED <<cViewID, cSeqNum>>
+       \/ /\ m.viewID > cViewID[c]
+          /\ cViewID' = [cViewID EXCEPT ![c] = m.viewID]
+          /\ cSeqNum' = [cSeqNum EXCEPT ![c] = 0]
           /\ UNCHANGED <<cReads>>
+       \/ /\ m.viewID < cViewID[c]
+          /\ UNCHANGED <<cViewID, cSeqNum, cReads>>
     /\ Discard(m)
     /\ UNCHANGED <<globalVars, replicaVars, cTime, cSeqNum, cResps, cWrites>>
 
@@ -400,17 +401,7 @@ Init ==
 ----
 
 \* The type invariant checks that no read ever reads a different value than a previous write
-Inv == 
-   /\ \A c1, c2 \in Clients :
-         ~\E r \in cReads[c1] :
-            \E w \in cWrites[c2] : 
-               /\ r.index = w.index 
-               /\ ~ChecksumsMatch(r.checksum, w.checksum)
-   /\ \A c1, c2 \in Clients:
-         ~\E r1 \in cReads[c1] :
-            \E r2 \in cReads[c2] :
-               /\ r1.index = r2.index 
-               /\ ~ChecksumsMatch(r1.checksum, r2.checksum)
+Inv == TRUE \* TODO
 
 Transition == transitions' = transitions + 1
 
@@ -473,5 +464,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 03:38:33 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 04:02:51 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
