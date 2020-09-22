@@ -14,7 +14,7 @@ CONSTANT Values
 \* An empty value
 CONSTANT Nil
 
-\* Request/response types+
+\* Request/response types
 CONSTANTS
     MClientRequest,
     MClientResponse,
@@ -26,7 +26,7 @@ CONSTANTS
     MViewChangeResponse,
     MStartViewRequest
 
-\* Replica roles
+\* Replica statuses
 CONSTANTS
     SNormal,
     SAborting,
@@ -39,53 +39,77 @@ CONSTANTS
 
 ----
 
+\* A sequence of replicas used for deterministic primary election
 VARIABLE replicas
 
 globalVars == <<replicas>>
 
+\* The set of all messages on the network
 VARIABLE messages
 
 messageVars == <<messages>>
 
+(* Local client state *)
+
+\* Strictly increasing representation of synchronized time
 VARIABLE cTime
 
+\* The highest known view ID for a client
 VARIABLE cViewID
 
+\* The current sequence number for a client
 VARIABLE cSeqNum
 
+\* A client response buffer
 VARIABLE cResps
 
+\* A set of all commits - used for model checking
 VARIABLE cCommits
 
 clientVars == <<cTime, cViewID, cSeqNum, cResps, cCommits>>
 
+(* Local replica state *)
+
+\* The current status of a replica
 VARIABLE rStatus
 
+\* A replica's commit log
 VARIABLE rLog
 
+\* The current view ID for a replica
 VARIABLE rViewID
 
+\* The current sequence number for each session
 VARIABLE rSeqNum
 
+\* The highest known timestamp for all sessions
 VARIABLE rTimestamp
 
+\* The last known normal view
 VARIABLE rLastViewID
 
+\* The set of received view change responses
 VARIABLE rViewChanges
 
+\* The point (client+sequence number) in the log currently being aborted
 VARIABLE rAbortPoint
 
+\* The set of abort responses received
 VARIABLE rAbortResps
 
-replicaVars == <<rStatus, rLog, rViewID, rSeqNum, rTimestamp, rLastViewID, rViewChanges, rAbortPoint, rAbortResps>>
+replicaVars == <<rStatus, rLog, rViewID, rSeqNum, rTimestamp,
+                 rLastViewID, rViewChanges, rAbortPoint, rAbortResps>>
 
+\* A counter used to limit the state space for model checking
 VARIABLE transitions
 
 vars == <<globalVars, messageVars, clientVars, replicaVars, transitions>>
 
 ----
 
-\* Helpers
+(*
+This section provides helpers for the spec.
+*)
 
 RECURSIVE SeqFromSet(_)
 SeqFromSet(S) == 
@@ -119,21 +143,33 @@ IsPrimary(r) == Primary(rViewID[r]) = r
 
 ----
 
-\* Messaging helpers
+(*
+This section models the network.
+*)
 
+\* Send a set of messages
 Sends(ms) == messages' = messages \cup ms
 
+\* Send a message
 Send(m) == Sends({m})
 
+\* Reply to a message with a set of responses
 Replies(req, resps) == messages' = (messages \cup resps) \ {req}
 
+\* Reply to a message
 Reply(req, resp) == Replies(req, {resp})
 
+\* Discard a message
 Discard(m) == messages' = messages \ {m}
 
 ----
 
-Write(c, v) ==
+(*
+This section models client requests.
+*)
+
+\* Client 'c' sends value 'v' to all replicas
+ClientRequest(c, v) ==
     /\ cTime' = cTime + 1
     /\ cSeqNum' = [cSeqNum EXCEPT ![c] = cSeqNum[c] + 1]
     /\ Sends({[src       |-> c,
@@ -145,27 +181,26 @@ Write(c, v) ==
                timestamp |-> cTime'] : r \in Replicas})
     /\ UNCHANGED <<globalVars, replicaVars, cViewID, cResps, cCommits>>
 
+\* Client 'c' handles a response 'm' from replica 'r'
 HandleClientResponse(c, r, m) ==
     /\ \/ /\ m.viewID = cViewID[c]
-          /\ IF m.seqNum \notin DOMAIN cResps[c][r] THEN
-                cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = cResps[c][r] @@ (m.seqNum :> m)]]
-             ELSE
-                cResps' = [cResps EXCEPT ![c] = [cResps[c] EXCEPT ![r] = [cResps[c][r] EXCEPT ![m.seqNum] = m]]]
+          /\ cResps' = [cResps EXCEPT ![c] = cResps[c] \cup {m}]
           /\ LET 
-                 allResps       == {cResps[c][r1][m.seqNum] : r1 \in {r2 \in Replicas : m.seqNum \in DOMAIN cResps[c][r2]}}
-                 succeededResps == {resp \in allResps : resp.viewID = cViewID[c] /\ resp.succeeded}
-                 isCommitted    == /\ \E resp \in succeededResps : resp.src = Primary(resp.viewID)
-                                   /\ {resp.src : resp \in succeededResps} \in Quorums
+                 seqNumResps == {n \in cResps[c] : n.seqNum = m.seqNum}
+                 goodResps   == {n \in seqNumResps : n.viewID = cViewID[c] /\ n.succeeded}
+                 isCommitted == /\ \E n \in goodResps : n.src = Primary(n.viewID)
+                                /\ {n.src : n \in goodResps} \in Quorums
              IN
                  /\ \/ /\ isCommitted
-                       /\ cCommits' = [cCommits EXCEPT ![c] = cCommits[c] \cup {CHOOSE resp \in succeededResps : resp.src = Primary(resp.viewID)}]
+                       /\ cCommits' = [cCommits EXCEPT ![c] = cCommits[c] \cup 
+                             {CHOOSE n \in goodResps : n.src = Primary(n.viewID)}]
                     \/ /\ ~isCommitted
                        /\ UNCHANGED <<cCommits>>
                  /\ UNCHANGED <<cViewID, cSeqNum>>
        \/ /\ m.viewID > cViewID[c]
           /\ cViewID' = [cViewID EXCEPT ![c] = m.viewID]
           /\ cSeqNum' = [cSeqNum EXCEPT ![c] = 0]
-          /\ cResps'  = [cResps  EXCEPT ![c] = [i \in Replicas |-> {}]]
+          /\ cResps'  = [cResps  EXCEPT ![c] = {}]
           /\ UNCHANGED <<cCommits>>
        \/ /\ m.viewID < cViewID[c]
           /\ UNCHANGED <<cCommits>>
@@ -174,16 +209,11 @@ HandleClientResponse(c, r, m) ==
 
 ----
 
-\* Log helpers
+(*
+This section models the replica protocol.
+*)
 
-ReplaceEntry(l, i, x) == [j \in 1..Max({Len(l), i}) |-> IF j = i THEN x ELSE l[j]]
-
-AppendEntry(l, r, c, e) == [l EXCEPT ![r] = [l[r] EXCEPT ![c] = Append(l[r][c], e)]]
-
-----
-
-\* Server request/response handling
-
+\* Replica 'r' requests a repair of the client 'c' request 'm'
 Repair(r, c, m) ==
     /\ Replies(m, {[src    |-> r,
                     dest   |-> d,
@@ -192,6 +222,7 @@ Repair(r, c, m) ==
                     client |-> c,
                     seqNum |-> rSeqNum[r][c] + 1] : d \in Replicas})
 
+\* Replica 'r' aborts the client 'c' request 'm'
 Abort(r, c, m) ==
     /\ IsPrimary(r)
     /\ rStatus[r]   = SNormal
@@ -206,6 +237,7 @@ Abort(r, c, m) ==
                     seqNum    |-> m.seqNum,
                     timestamp |-> m.timestamp] : d \in Replicas})
 
+\* Replica 'r' handles client 'c' request 'm'
 HandleClientRequest(r, c, m) ==
     /\ rStatus[r] = SNormal
     /\ \/ /\ m.viewID = rViewID[r]
@@ -219,10 +251,12 @@ HandleClientRequest(r, c, m) ==
                                    index     |-> index,
                                    value     |-> m.value,
                                    timestamp |-> m.timestamp]
+                 append(e)     == [rLog EXCEPT ![r] = [rLog[r] EXCEPT 
+                                               ![c] = Append(rLog[r][c], e)]]
              IN
                 \/ /\ isSequential
                    /\ isLinear
-                   /\ rLog' = AppendEntry(rLog, r, c, entry)
+                   /\ rLog' = append(entry)
                    /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![c] = m.seqNum]]
                    /\ rTimestamp' = [rTimestamp EXCEPT ![r] = m.timestamp]
                    /\ Reply(m, [src       |-> r,
@@ -231,6 +265,7 @@ HandleClientRequest(r, c, m) ==
                                 viewID    |-> rViewID[r],
                                 seqNum    |-> m.seqNum,
                                 index     |-> index,
+                                value     |-> m.value,
                                 succeeded |-> TRUE])
                    /\ UNCHANGED <<rStatus, rAbortPoint, rAbortResps>>
                 \/ /\ \/ ~isSequential
@@ -256,6 +291,7 @@ HandleClientRequest(r, c, m) ==
           /\ UNCHANGED <<rStatus, rLog, rSeqNum, rTimestamp, rAbortPoint, rAbortResps>>
     /\ UNCHANGED <<globalVars, clientVars, rViewID, rLastViewID, rViewChanges>>
 
+\* Replica 'r' handles replica 's' repair request 'm'
 HandleRepairRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ IsPrimary(r)
@@ -274,20 +310,25 @@ HandleRepairRequest(r, s, m) ==
                 /\ Abort(r, m.client, m)
     /\ UNCHANGED <<globalVars, clientVars>>
 
+\* Replica 'r' handles replica 's' repair response 'm'
 HandleRepairResponse(r, s, m) ==
     /\ HandleClientRequest(r, m.client, [m EXCEPT !.src = m.client])
 
+\* Replica 'r' handles replica 's' abort request 'm'
 HandleAbortRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ rStatus[r] \in {SNormal, SAborting}
     /\ LET 
            offset == Len(rLog[r][m.client]) + 1 - (rSeqNum[r][m.client] - m.seqNum)
            entry == [type |-> TNoOp, timestamp |-> m.timestamp]
+           replace(i, e) == [j \in 1..Max({Len(rLog[r][m.client]), i}) |->
+                                IF j = i THEN e ELSE rLog[r][m.client][j]]
        IN
           /\ offset <= Len(rLog[r][m.client]) + 1
-          /\ rLog' = AppendEntry(rLog, r, m.client, entry)
+          /\ rLog' = replace(offset, entry)
           /\ rTimestamp' = [rTimestamp EXCEPT ![r] = Max({rTimestamp[r], m.timestamp})]
-          /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![m.client] = Max({rSeqNum[r][m.client], m.seqNum})]]
+          /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT 
+                                        ![m.client] = Max({rSeqNum[r][m.client], m.seqNum})]]
           /\ Replies(m, {[src       |-> r,
                           dest      |-> Primary(rViewID[r]),
                           type      |-> MAbortResponse,
@@ -300,8 +341,10 @@ HandleAbortRequest(r, s, m) ==
                           viewID    |-> rViewID[r],
                           seqNum    |-> m.seqNum,
                           succeeded |-> FALSE]})
-    /\ UNCHANGED <<globalVars, clientVars, rStatus, rAbortPoint, rAbortResps, rViewID, rLastViewID, rViewChanges>>
+    /\ UNCHANGED <<globalVars, clientVars, rStatus, rAbortPoint, 
+                   rAbortResps, rViewID, rLastViewID, rViewChanges>>
 
+\* Replica 'r' handles replica 's' repair response 'm'
 HandleAbortResponse(r, s, m) ==
     /\ rStatus[r] = SAborting
     /\ m.viewID = rViewID[r]
@@ -318,8 +361,10 @@ HandleAbortResponse(r, s, m) ==
              /\ rStatus' = [rStatus EXCEPT ![r] = SNormal]
           \/ /\ ~isQuorum
              /\ UNCHANGED <<rStatus>>
-    /\ UNCHANGED <<globalVars, messageVars, clientVars, rLog, rSeqNum, rTimestamp, rAbortPoint, rViewID, rViewChanges, rLastViewID>>
+    /\ UNCHANGED <<globalVars, messageVars, clientVars, rLog, rSeqNum, rTimestamp, 
+                   rAbortPoint, rViewID, rViewChanges, rLastViewID>>
 
+\* Replica 'r' requests a view change
 ChangeView(r) ==
     /\ Sends({[src    |-> r,
                dest   |-> d,
@@ -327,6 +372,7 @@ ChangeView(r) ==
                viewID |-> rViewID[r] + 1] : d \in Replicas})
     /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
 
+\* Replica 'r' handles replica 's' view change request 'm'
 HandleViewChangeRequest(r, s, m) ==
     /\ rViewID[r] < m.viewID
     /\ rViewID'      = [rViewID EXCEPT ![r] = m.viewID]
@@ -338,31 +384,35 @@ HandleViewChangeRequest(r, s, m) ==
                  viewID     |-> m.viewID,
                  lastViewID |-> rLastViewID[r],
                  logs       |-> rLog[r]])
-    /\ UNCHANGED <<globalVars, clientVars, rLog, rSeqNum, rTimestamp, rAbortPoint, rAbortResps, rLastViewID>>
+    /\ UNCHANGED <<globalVars, clientVars, rLog, rSeqNum, rTimestamp,  
+                   rAbortPoint, rAbortResps, rLastViewID>>
 
+\* Replica 'r' handles replica 's' view change response 'm'
 HandleViewChangeResponse(r, s, m) ==
     /\ IsPrimary(r)
     /\ rViewID[r]    = m.viewID
     /\ rStatus[r]    = SViewChange
     /\ rViewChanges' = [rViewChanges EXCEPT ![r] = rViewChanges[r] \cup {m}]
-    /\ LET viewChanges    == {v \in rViewChanges'[r] : v.viewID = rViewID[r]}
-           viewSources    == {v.src : v \in viewChanges}
-           isQuorum       == r \in viewSources /\ viewSources \in Quorums
-           lastViewIDs    == {v.lastViewID : v \in viewChanges}
-           lastViewID     == (CHOOSE v1 \in lastViewIDs : \A v2 \in lastViewIDs : v2 <= v1)
-           viewLogs       == [c \in Clients |-> {v1.logs[c] : v1 \in {v2 \in viewChanges : v2.lastViewID = lastViewID}}]
-           mergeEnts(es)  ==
-               IF es = {} \/ \E e \in es : r.type = TNoOp THEN
+    /\ LET viewChanges     == {v \in rViewChanges'[r] : v.viewID = rViewID[r]}
+           viewSources     == {v.src : v \in viewChanges}
+           isQuorum        == r \in viewSources /\ viewSources \in Quorums
+           lastViewIDs     == {v.lastViewID : v \in viewChanges}
+           lastViewID      == (CHOOSE v1 \in lastViewIDs : \A v2 \in lastViewIDs : v2 <= v1)
+           lastViewChanges == {v2 \in viewChanges : v2.lastViewID = lastViewID}
+           viewLogs        == [c \in Clients |-> {v1.logs[c] : v1 \in lastViewChanges}]
+           mergeEnts(es)   ==
+               IF es = {} \/ \E e \in es : e.type = TNoOp THEN
                    [type |-> TNoOp]
                ELSE
                    CHOOSE e \in es : e.type # TNoOp
-           range(ls)      == Max({Len(l) : l \in ls})
-           entries(ls, i) == {l[i] : l \in {k \in ls : i <= Len(k)}}
-           mergeLogs(ls)  == [i \in 1..range(ls) |-> mergeEnts(entries(ls, i))]
-           viewLog        == [c \in Clients |-> mergeLogs(viewLogs[c])]
-           viewRange      == Max({Len(viewLog[c]) : c \in Clients})
-           viewTimestamp  == IF viewRange > 0 THEN
-                                 Max(UNION {{l[i].timestamp : i \in DOMAIN l} : l \in {viewLog[c] : c \in Clients}})
+           range(ls)       == Max({Len(l) : l \in ls})
+           entries(ls, i)  == {l[i] : l \in {k \in ls : i <= Len(k)}}
+           mergeLogs(ls)   == [i \in 1..range(ls) |-> mergeEnts(entries(ls, i))]
+           viewLog         == [c \in Clients |-> mergeLogs(viewLogs[c])]
+           viewRange       == Max({Len(viewLog[c]) : c \in Clients})
+           viewTimestamp   == IF viewRange > 0 THEN
+                                 Max(UNION {{l[i].timestamp : i \in DOMAIN l} :
+                                                l \in {viewLog[c] : c \in Clients}})
                              ELSE 0
        IN
            \/ /\ isQuorum
@@ -374,8 +424,10 @@ HandleViewChangeResponse(r, s, m) ==
                               log       |-> viewLog] : d \in Replicas})
            \/ /\ ~isQuorum
               /\ Discard(m)
-    /\ UNCHANGED <<globalVars, clientVars, rStatus, rViewID, rLog, rSeqNum, rTimestamp, rAbortPoint, rAbortResps, rLastViewID>>
+    /\ UNCHANGED <<globalVars, clientVars, rStatus, rViewID, rLog, rSeqNum, 
+                   rTimestamp, rAbortPoint, rAbortResps, rLastViewID>>
 
+\* Replica 'r' handles replica 's' start view request 'm'
 HandleStartViewRequest(r, s, m) ==
     /\ \/ rViewID[r] < m.viewID
        \/ /\ rViewID[r] = m.viewID
@@ -399,7 +451,7 @@ InitClientVars ==
     /\ cTime    = 0
     /\ cViewID  = [c \in Clients |-> 1]
     /\ cSeqNum  = [c \in Clients |-> 0]
-    /\ cResps   = [c \in Clients |-> [r \in Replicas |-> [s \in {} |-> [index |-> 0]]]]
+    /\ cResps   = [c \in Clients |-> {}]
     /\ cCommits = [c \in Clients |-> {}]
 
 InitReplicaVars ==
@@ -422,8 +474,9 @@ Init ==
 
 ----
 
-\* The type invariant checks that no read ever reads a different value than a previous write
-Inv ==
+\* The type invariant verifies that clients do not receive two commits at the 
+\* same index with different values.
+TypeOK ==
     \A c1, c2 \in Clients :
        \A e1 \in cCommits[c1] :
           ~\E e2 \in cCommits[c2] :
@@ -435,7 +488,7 @@ Transition == transitions' = transitions + 1
 Next ==
     \/ \E c \in Clients :
           \E v \in Values :
-             /\ Write(c, v)
+             /\ ClientRequest(c, v)
              /\ Transition
     \/ \E r \in Replicas : 
           /\ ChangeView(r)
@@ -476,10 +529,11 @@ Next ==
           /\ m.type = MStartViewRequest
           /\ HandleStartViewRequest(m.dest, m.src, m)
           /\ Transition
+    \/ \E m \in messages : Discard(m)
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 12:13:15 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 12:57:49 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
