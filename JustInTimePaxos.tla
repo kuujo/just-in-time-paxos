@@ -43,8 +43,6 @@ VARIABLE messages
 
 messageVars == <<messages>>
 
-VARIABLE globalTime
-
 VARIABLE time
 
 VARIABLE requestID
@@ -55,7 +53,7 @@ VARIABLE writes
 
 VARIABLE reads
 
-clientVars == <<globalTime, time, requestID, responses, writes, reads>>
+clientVars == <<time, requestID, responses, writes, reads>>
 
 VARIABLE status
 
@@ -109,23 +107,14 @@ Discard(m) == messages' = messages \ {m}
 
 ----
 
-AdvanceTime(c) == 
-    /\ globalTime' = globalTime + 1
-    /\ IF time[c] < globalTime /\ globalTime - time[c] > MaxClockInterval THEN
-           time' = [time EXCEPT ![c] = globalTime' - MaxClockInterval]
-       ELSE
-           time' = [time EXCEPT ![c] = time[c] + 1]
-
-CurrentTime(c) == time'[c]
-
 Write(c) ==
-    /\ AdvanceTime(c)
+    /\ time' = time + 1
     /\ requestID' = [requestID EXCEPT ![c] = requestID[c] + 1]
     /\ Sends({[src       |-> c,
                dest      |-> r,
                type      |-> WriteRequest,
                requestID |-> requestID'[c],
-               timestamp |-> CurrentTime(c)] : r \in Replicas})
+               timestamp |-> time'] : r \in Replicas})
     /\ UNCHANGED <<globalVars, replicaVars, responses, writes, reads>>
 
 Read(c) ==
@@ -134,7 +123,7 @@ Read(c) ==
                dest      |-> r,
                type      |-> ReadRequest,
                requestID |-> requestID'[c]] : r \in Replicas})
-    /\ UNCHANGED <<globalVars, replicaVars, globalTime, time, responses, writes, reads>>
+    /\ UNCHANGED <<globalVars, replicaVars, time, responses, writes, reads>>
 
 ChecksumsMatch(c1, c2) ==
     /\ Len(c1) = Len(c2)
@@ -162,7 +151,7 @@ HandleWriteResponse(c, r, m) ==
                 \/ /\ ~committed
                    /\ UNCHANGED <<writes>>
     /\ Discard(m)
-    /\ UNCHANGED <<globalVars, replicaVars, globalTime, time, requestID, reads>>
+    /\ UNCHANGED <<globalVars, replicaVars, time, requestID, reads>>
 
 HandleReadResponse(c, r, m) ==
     /\ \/ /\ m.primary
@@ -171,7 +160,7 @@ HandleReadResponse(c, r, m) ==
        \/ /\ ~m.primary
           /\ UNCHANGED <<reads>>
     /\ Discard(m)
-    /\ UNCHANGED <<globalVars, replicaVars, globalTime, time, requestID, responses, writes>>
+    /\ UNCHANGED <<globalVars, replicaVars, time, requestID, responses, writes>>
 
 ----
 
@@ -301,8 +290,7 @@ InitMessageVars ==
     /\ messages = {}
 
 InitClientVars ==
-    /\ globalTime = 0
-    /\ time       = [c \in Clients |-> 0]
+    /\ time = 0
     /\ requestID  = [c \in Clients |-> 0]
     /\ responses  = [c \in Clients |-> [r \in Replicas |-> [s \in {} |-> [index |-> 0, checksum |-> Nil]]]]
     /\ writes     = [c \in Clients |-> {}]
@@ -382,5 +370,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Mon Sep 21 22:04:34 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 01:06:09 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
