@@ -253,23 +253,25 @@ HandleViewChangeResponse(r, s, m) ==
     /\ viewChanges' = [viewChanges EXCEPT ![r] = viewChanges[r] \cup {m}]
     /\ LET
           isViewQuorum(vs) == IsQuorum(vs) /\ \E v \in vs : v.src = r
-          newViewChanges == {v \in viewChanges'[r] : v.viewID = viewID[r]}
-          normalViews == {v.lastNormal : v \in newViewChanges}
-          lastNormal == CHOOSE v \in normalViews : \A v2 \in normalViews : v2 <= v
-          goodLogs == {n.log : n \in {v \in newViewChanges : v.lastNormal = lastNormal}}
-          combineLogs(ls) ==
+          newViewChanges   == {v \in viewChanges'[r] : v.viewID = viewID[r]}
+          normalViews      == {v.lastNormal : v \in newViewChanges}
+          lastNormal       == CHOOSE v \in normalViews : \A v2 \in normalViews : v2 <= v
+          goodLogs         == {n.log : n \in {v \in newViewChanges : v.lastNormal = lastNormal}}
+          combineLogs(ls)  ==
              LET 
-                logsWith(i)     == {l \in ls : Len(l) >= i}
-                entries(i)      == {l[i] : l \in logsWith(i)}
-                quorums(i)      == {l \in SUBSET logsWith(i) : IsQuorum(l)}
-                checksums(l, i) == {e.checksum : e \in l[i]}
-                isCommitted(i)  == \E e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
-                entry(i)        == CHOOSE e \in entries(i) : \A l \in quorums(i) : e.checksum \in checksums(l, i)
-                maxIndex        == Max({Len(l) : l \in ls})
-                commits         == {i \in 1..maxIndex : isCommitted(i)}
-                maxCommit       == IF Cardinality(commits) > 0 THEN Max(commits) ELSE 0
+                indexLogs(i)           == {l \in ls : Len(l) >= i}
+                indexEntries(i)        == {l[i] : l \in indexLogs(i)}
+                quorumLogs(i)          == {L \in SUBSET indexLogs(i) : IsQuorum(L)}
+                isCommittedEntry(i, e) == \A L \in quorumLogs(i) :
+                                             \E l \in L : 
+                                                ChecksumsMatch(e.checksum, l[i].checksum)
+                isCommittedIndex(i)    == \E e \in indexEntries(i) : isCommittedEntry(i, e)
+                commit(i)              == CHOOSE e \in indexEntries(i) : isCommittedEntry(i, e)
+                maxIndex               == Max({Len(l) : l \in ls})
+                committedIndexes       == {i \in 1..maxIndex : isCommittedIndex(i)}
+                maxCommit              == IF Cardinality(committedIndexes) > 0 THEN Max(committedIndexes) ELSE 0
              IN
-                [i \in 1..maxCommit |-> entry(i)]
+                [i \in 1..maxCommit |-> commit(i)]
        IN
           \/ /\ isViewQuorum(newViewChanges)
              /\ Replies(m, {[src    |-> r,
@@ -380,5 +382,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Mon Sep 21 17:36:58 PDT 2020 by jordanhalterman
+\* Last modified Mon Sep 21 22:04:34 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
