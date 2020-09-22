@@ -207,23 +207,31 @@ Abort(r, c, m) ==
 HandleWriteRequest(r, c, m) ==
     /\ rStatus[r] = SNormal
     /\ \/ /\ m.viewID = rViewID[r]
-          /\ m.seqNum = rSeqNum[r][c] + 1
-          /\ LET entry == [type |-> TValue, value |-> m.value, timestamp |-> m.timestamp]
-             IN  rLog' = [rLog EXCEPT ![r] = Append(rLog[r], entry)]
-          /\ rSeqNum' = [rSeqNum EXCEPT ![r] = m.seqNum]
-          /\ Reply(m, [src       |-> r,
-                       dest      |-> c,
-                       type      |-> MWriteResponse,
-                       seqNum    |-> m.seqNum,
-                       viewID    |-> rViewID[r],
-                       succeeded |-> TRUE])
-       \/ /\ m.viewID = rViewID[r]
-          /\ m.seqNum > rSeqNum[r][c] + 1
-          /\ \/ /\ IsPrimary(r)
-                /\ Abort(r, c, m)
-             \/ /\ ~IsPrimary(r)
-                /\ Repair(r, c, m)
-          /\ UNCHANGED <<rLog>>
+          /\ LET
+                 isSequential == m.seqNum = rSeqNum[r][c] + 1
+                 isLinear     == \A i \in DOMAIN rLog[r] : \A e \in rLog[r][i] : m.timestamp > e.timestamp
+             IN
+                \/ /\ isSequential
+                   /\ isLinear
+                   /\ rLog' = [rLog    EXCEPT ![r] = [
+                               rLog[r] EXCEPT ![c] = 
+                                   Append(rLog[r][c], [type      |-> TValue, 
+                                                       value     |-> m.value,
+                                                       timestamp |-> m.timestamp])]]
+                   /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![c] = m.seqNum]]
+                   /\ Reply(m, [src       |-> r,
+                                dest      |-> c,
+                                type      |-> MWriteResponse,
+                                seqNum    |-> m.seqNum,
+                                viewID    |-> rViewID[r],
+                                succeeded |-> TRUE])
+                \/ /\ \/ ~isSequential
+                      \/ ~isLinear
+                   /\ \/ /\ IsPrimary(r)
+                         /\ Abort(r, c, m)
+                      \/ /\ ~IsPrimary(r)
+                         /\ Repair(r, c, m)
+                   /\ UNCHANGED <<rLog>>
        \/ /\ m.viewID < rViewID[r]
           /\ Reply(m, [src       |-> r,
                        dest      |-> c,
@@ -270,8 +278,7 @@ HandleAbortRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ m.seqNum <= Len(rLog[r][m.client]) + 1
     /\ rStatus[r] \in {SNormal, SAborting} 
-    /\ LET entry == [type |-> TNoOp]
-       IN rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT ![m.client] = Replace(rLog[r][m.client], m.seqNum, entry)]]
+    /\ rLog' = [rLog EXCEPT ![r] = [rLog[r] EXCEPT ![m.client] = Replace(rLog[r][m.client], m.seqNum, [type |-> TNoOp])]]
     /\ \/ /\ m.seqNum > rSeqNum[r][m.client]
           /\ rSeqNum' = [rSeqNum EXCEPT ![r] = [rSeqNum[r] EXCEPT ![m.client] = m.seqNum]]
        \/ /\ m.seqNum <= rSeqNum[r][m.client]
@@ -464,5 +471,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Tue Sep 22 04:02:51 PDT 2020 by jordanhalterman
+\* Last modified Tue Sep 22 04:25:22 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
