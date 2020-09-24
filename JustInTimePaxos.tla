@@ -455,9 +455,8 @@ HandleAbortRequest(r, s, m) ==
     /\ m.viewID = rViewID[r]
     /\ rStatus[r] \in {SNormal, SAborting}
     /\ LET 
-           offset           == Len(rLog[r][m.client]) - (rSeqNum[r][m.client] - m.seqNum)
-           entry            == [type |-> TNoOp, timestamp |-> 0]
-           replace(l, i, e) == [j \in 1..Max({Len(l), i}) |-> IF j = i THEN e ELSE l[j]]
+           offset == Len(rLog[r][m.client]) - (rSeqNum[r][m.client] - m.seqNum)
+           entry  == [type |-> TNoOp, value |-> Nil, timestamp |-> 0]
        IN
           /\ \/ /\ offset <= Len(rLog[r][m.client])
                 /\ rLog' = [rLog EXCEPT ![r] = [
@@ -468,7 +467,7 @@ HandleAbortRequest(r, s, m) ==
              \/ /\ offset = Len(rLog[r][m.client]) + 1
                 /\ rLog' = [rLog EXCEPT ![r] = [
                             rLog[r] EXCEPT ![m.client] = 
-                               Append(rLog[r][m.client], [type |-> TNoOp, timestamp |-> 0])]]
+                               Append(rLog[r][m.client], entry)]]
                 /\ rTimestamp' = [rTimestamp EXCEPT ![r] = Max({rTimestamp[r], m.timestamp})]
                 /\ rSeqNum'    = [rSeqNum    EXCEPT ![r] = [
                                   rSeqNum[r] EXCEPT ![m.client] = m.seqNum]]
@@ -680,5 +679,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Wed Sep 23 19:09:39 PDT 2020 by jordanhalterman
+\* Last modified Thu Sep 24 10:56:11 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
