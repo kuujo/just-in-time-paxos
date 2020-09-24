@@ -398,6 +398,7 @@ HandleClientRequest(r, c, m) ==
                                 viewID    |-> rViewID[r],
                                 seqNum    |-> m.seqNum,
                                 index     |-> index,
+                                timestamp |-> m.timestamp,
                                 value     |-> m.value,
                                 succeeded |-> TRUE])
                    /\ UNCHANGED <<rStatus, rAbortPoint, rAbortReps>>
@@ -622,62 +623,147 @@ InitReplicaVars ==
     /\ rLastViewID  = [r \in Replicas |-> 1]
     /\ rViewChanges = [r \in Replicas |-> {}]
 
+VARIABLE step
+
 Init ==
     /\ InitMessageVars
     /\ InitClientVars
     /\ InitReplicaVars
+    /\ step = 1
 
 ----
 
-\* The type invariant verifies that clients do not receive two commits at the 
-\* same index with different values.
-TypeOK ==
+(*
+This section specifies the invariants for the protocol.
+*)
+
+\* Merges the set of logs 'L' into a single ordered log
+RECURSIVE MergeLogs(_)
+MergeLogs(L) == 
+    IF ~\E l \in L : Len(l) > 0 THEN
+        <<>>
+    ELSE
+        LET nextLog == CHOOSE l1 \in L : 
+                /\ Len(l1) > 0 
+                /\ \A l2 \in L : 
+                   \/ Len(l2) = 0
+                   \/ l1[1].timestamp <= l2[1].timestamp
+            nextEntry == nextLog[1]
+            newLogs == {IF Len(l) > 0 /\ l[1].timestamp = nextEntry.timestamp THEN
+                            [i \in 1..Len(l)-1 |-> l[i+1]]
+                        ELSE l : l \in L}
+        IN
+            <<nextEntry>> \o MergeLogs(newLogs)
+
+\* The commit order invariant asserts that no two commits with the
+\* same index
+CommitOrderInv ==
     \A c1, c2 \in Clients :
        \A e1 \in cCommits[c1] :
           ~\E e2 \in cCommits[c2] :
              /\ e1.index = e2.index
              /\ e1.value # e2.value
 
+\* The type invariant asserts that the leader's log will never contain a different
+\* value at the same index as a client commit.
+TypeOK ==
+    \A c \in Clients :
+       \A e \in cCommits[c] :
+          ~\E r \in Replicas :
+             /\ Primary(rViewID[r]) = r
+             /\ rStatus[r] = SNormal
+             /\ LET logs == MergeLogs({rLog[r][i] : i \in DOMAIN rLog[r]})
+                IN
+                   /\ Len(logs) >= e.index
+                   /\ logs[e.index].value # e.value
+
+----
+
+NextClientRequest == 
+    \E c \in Clients :
+       \E v \in Values :
+          ClientRequest(c, v)
+
+NextChangeView ==
+    \E r \in Replicas : 
+       ChangeView(r)
+
+NextHandleClientRequest ==
+    \E m \in messages :
+       /\ m.type = MClientRequest
+       /\ HandleClientRequest(m.dest, m.src, m)
+
+NextHandleClientReply ==
+    \E m \in messages :
+       /\ m.type = MClientReply
+       /\ HandleClientReply(m.dest, m.src, m)
+
+NextHandleRepairRequest ==
+    \E m \in messages :
+       /\ m.type = MRepairRequest
+       /\ HandleRepairRequest(m.dest, m.src, m)
+
+NextHandleRepairReply ==
+    \E m \in messages :
+       /\ m.type = MRepairReply
+       /\ HandleRepairReply(m.dest, m.src, m)
+
+NextHandleAbortRequest ==
+    \E m \in messages :
+       /\ m.type = MAbortRequest
+       /\ HandleAbortRequest(m.dest, m.src, m)
+
+NextHandleAbortReply ==
+    \E m \in messages :
+       /\ m.type = MAbortReply
+       /\ HandleAbortReply(m.dest, m.src, m)
+
+NextHandleViewChangeRequest ==
+    \E m \in messages :
+       /\ m.type = MViewChangeRequest
+       /\ HandleViewChangeRequest(m.dest, m.src, m)
+
+NextHandleViewChangeReply ==
+    \E m \in messages :
+       /\ m.type = MViewChangeReply
+       /\ HandleViewChangeReply(m.dest, m.src, m)
+
+NextHandleStartViewRequest ==
+    \E m \in messages :
+       /\ m.type = MStartViewRequest
+       /\ HandleStartViewRequest(m.dest, m.src, m)
+
+NextDropMessage ==
+    \E m \in messages :
+       /\ Discard(m)
+       /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
+
 Next ==
-    \/ \E c \in Clients :
-          \E v \in Values :
-             /\ ClientRequest(c, v)
-    \/ \E r \in Replicas : 
-          /\ ChangeView(r)
-    \/ \E m \in messages :
-          /\ m.type = MClientRequest
-          /\ HandleClientRequest(m.dest, m.src, m)
-    \/ \E m \in messages :
-          /\ m.type = MClientReply
-          /\ HandleClientReply(m.dest, m.src, m)
-    \/ \E m \in messages :
-          /\ m.type = MRepairRequest
-          /\ HandleRepairRequest(m.dest, m.src, m)
-    \/ \E m \in messages :
-          /\ m.type = MRepairReply
-          /\ HandleRepairReply(m.dest, m.src, m)
-    \/ \E m \in messages :
-          /\ m.type = MAbortRequest
-          /\ HandleAbortRequest(m.dest, m.src, m)
-    \/ \E m \in messages :
-          /\ m.type = MAbortReply
-          /\ HandleAbortReply(m.dest, m.src, m)
-    \/ \E m \in messages :
-          /\ m.type = MViewChangeRequest
-          /\ HandleViewChangeRequest(m.dest, m.src, m)
-    \/ \E m \in messages :
-          /\ m.type = MViewChangeReply
-          /\ HandleViewChangeReply(m.dest, m.src, m)
-    \/ \E m \in messages :
-          /\ m.type = MStartViewRequest
-          /\ HandleStartViewRequest(m.dest, m.src, m)
-    \/ \E m \in messages : 
-          /\ Discard(m)
-          /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
+    \/ NextClientRequest
+    \/ NextClientRequest
+    \/ NextHandleClientRequest
+    \/ NextHandleClientRequest
+    \/ NextHandleClientRequest
+    \/ NextHandleClientRequest
+    \/ NextHandleClientReply
+    \/ NextHandleClientReply
+    \/ NextHandleClientReply
+    \/ NextHandleClientReply
+    \/ NextChangeView
+    \/ NextHandleViewChangeRequest
+    \/ NextHandleViewChangeRequest
+    \/ NextHandleViewChangeReply
+    \/ NextHandleViewChangeReply
+    \/ NextHandleStartViewRequest
+    \/ NextClientRequest
+    \/ NextHandleClientRequest
+    \/ NextHandleClientRequest
+    \/ NextHandleClientReply
+    \/ NextHandleClientReply
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Thu Sep 24 10:56:11 PDT 2020 by jordanhalterman
+\* Last modified Thu Sep 24 14:21:09 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
