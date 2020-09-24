@@ -623,13 +623,10 @@ InitReplicaVars ==
     /\ rLastViewID  = [r \in Replicas |-> 1]
     /\ rViewChanges = [r \in Replicas |-> {}]
 
-VARIABLE step
-
 Init ==
     /\ InitMessageVars
     /\ InitClientVars
     /\ InitReplicaVars
-    /\ step = 1
 
 ----
 
@@ -740,30 +737,21 @@ NextDropMessage ==
 
 Next ==
     \/ NextClientRequest
-    \/ NextClientRequest
-    \/ NextHandleClientRequest
-    \/ NextHandleClientRequest
-    \/ NextHandleClientRequest
-    \/ NextHandleClientRequest
-    \/ NextHandleClientReply
-    \/ NextHandleClientReply
-    \/ NextHandleClientReply
-    \/ NextHandleClientReply
     \/ NextChangeView
+    \/ NextHandleClientRequest
+    \/ NextHandleClientReply
+    \/ NextHandleRepairRequest
+    \/ NextHandleRepairReply
+    \/ NextHandleAbortRequest
+    \/ NextHandleAbortReply
     \/ NextHandleViewChangeRequest
-    \/ NextHandleViewChangeRequest
-    \/ NextHandleViewChangeReply
     \/ NextHandleViewChangeReply
     \/ NextHandleStartViewRequest
-    \/ NextClientRequest
-    \/ NextHandleClientRequest
-    \/ NextHandleClientRequest
-    \/ NextHandleClientReply
-    \/ NextHandleClientReply
+    \/ NextDropMessage
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Thu Sep 24 14:21:09 PDT 2020 by jordanhalterman
+\* Last modified Thu Sep 24 14:24:29 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
