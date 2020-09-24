@@ -652,15 +652,6 @@ MergeLogs(L) ==
         IN
             <<nextEntry>> \o MergeLogs(newLogs)
 
-\* The commit order invariant asserts that no two commits with the
-\* same index
-CommitOrderInv ==
-    \A c1, c2 \in Clients :
-       \A e1 \in cCommits[c1] :
-          ~\E e2 \in cCommits[c2] :
-             /\ e1.index = e2.index
-             /\ e1.value # e2.value
-
 \* The type invariant asserts that the leader's log will never contain a different
 \* value at the same index as a client commit.
 TypeOK ==
@@ -753,5 +744,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Thu Sep 24 14:24:29 PDT 2020 by jordanhalterman
+\* Last modified Thu Sep 24 14:24:56 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
