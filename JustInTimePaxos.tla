@@ -1,6 +1,6 @@
 -------------------------- MODULE JustInTimePaxos --------------------------
 
-EXTENDS Naturals, Sequences, FiniteSets, TLC
+EXTENDS Naturals, Reals, Sequences, FiniteSets, TLC
 
 \* The set of Paxos replicas
 CONSTANT Replicas
@@ -18,120 +18,21 @@ CONSTANT Nil
 CONSTANTS
     MClientRequest,
     MClientReply,
+    MReconcileRequest,
+    MReconcileReply,
     MRepairRequest,
     MRepairReply,
-    MAbortRequest,
-    MAbortReply,
-    MViewChangeRequest,
+    MViewChange,
     MViewChangeReply,
-    MStartViewRequest
+    MStartView
 
 \* Replica statuses
 CONSTANTS
     SNormal,
-    SAborting,
+    SRepair,
     SViewChange
 
-\* Entry types
-CONSTANTS
-    TValue,
-    TNoOp
-
-(*
-Message schemas
-
-ViewIDs == [viewID |-> n \in (1..)]
-
-  ClientRequest
-    [src       |-> c \in Clients,
-     dest      |-> r \in Replicas,
-     type      |-> MClientRequest,
-     viewID    |-> i \in ViewIDs,
-     value     |-> v \in Values,
-     seqNum    |-> s \in (1..),
-     timestamp |-> t \in (1..)]
-
-  ClientReply
-    [src       |-> r \in Replicas,
-     dest      |-> c \in Clients,
-     type      |-> MClientReply,
-     viewID    |-> i \in ViewIDs,
-     value     |-> v \in Values,
-     seqNum    |-> s \in (1..),
-     index     |-> i \in (1..),
-     succeeded |-> TRUE \/ FALSE]
-
-  RepairRequest
-    [src       |-> r \in Replicas,
-     dest      |-> r \in Replicas,
-     type      |-> MRepairRequest,
-     viewID    |-> i \in ViewIDs,
-     client    |-> c \in Clients,
-     seqNum    |-> s \in (1..),
-     timestamp |-> t \in (1..)]
-
-  RepairReply
-    [src       |-> r \in Replicas,
-     dest      |-> r \in Replicas,
-     type      |-> MRepairReply,
-     viewID    |-> i \in ViewIDs,
-     client    |-> c \in Clients,
-     seqNum    |-> s \in (1..),
-     value     |-> v \in Values,
-     timestamp |-> t \in (1..)]
-
-  AbortRequest
-    [src       |-> r \in Replicas,
-     dest      |-> r \in Replicas,
-     type      |-> MAbortRequest,
-     viewID    |-> i \in ViewIDs,
-     client    |-> c \in Clients,
-     seqNum    |-> s \in (1..),
-     timestamp |-> t \in (1..)]
-
-  AbortReply
-    [src       |-> r \in Replicas,
-     dest      |-> r \in Replicas,
-     type      |-> MAbortReply,
-     viewID    |-> i \in ViewIDs,
-     client    |-> c \in Clients,
-     seqNum    |-> s \in (1..)]
-
-  ViewChangeRequest
-    [src        |-> r \in Replicas,
-     dest       |-> r \in Replicas,
-     type       |-> MViewChangeRequest,
-     viewID     |-> i \in ViewIDs]
-  
-  ViewChangeReply
-    [src        |-> r \in Replicas,
-     dest       |-> r \in Replicas,
-     type       |-> MViewChangeReply,
-     viewID     |-> i \in ViewIDs,
-     lastViewID |-> i \in (1..),
-     log        |-> [c \in Clients |-> [
-                       i \in 1..(1..) |-> [
-                           value |-> v \in Values, 
-                           timestamp |-> (1..)]]]]
-  
-  StartViewRequest
-    [src       |-> r \in Replicas,
-     dest      |-> r \in Replicas,
-     type      |-> MStartViewRequest,
-     viewID    |-> i \in ViewIDs,
-     timestamp |-> t \in (1..),
-     log        |-> [c \in Clients |-> [
-                       i \in 1..(1..) |-> [
-                           value |-> v \in Values, 
-                           timestamp |-> (1..)]]]]
-*)
-
 ----
-
-\* A sequence of replicas used for deterministic primary election
-VARIABLE replicas
-
-globalVars == <<replicas>>
 
 \* The set of all messages on the network
 VARIABLE messages
@@ -139,7 +40,10 @@ VARIABLE messages
 \* The total number of messages sent
 VARIABLE messageCount
 
-messageVars == <<messages, messageCount>>
+\* The total number of steps executed
+VARIABLE stepCount
+
+messageVars == <<messages, messageCount, stepCount>>
 
 (* Local client state *)
 
@@ -149,8 +53,8 @@ VARIABLE cTime
 \* The highest known view ID for a client
 VARIABLE cViewID
 
-\* The current sequence number for a client
-VARIABLE cSeqNum
+\* Client request IDs
+VARIABLE cReqID
 
 \* A client response buffer
 VARIABLE cReps
@@ -158,7 +62,7 @@ VARIABLE cReps
 \* A set of all commits - used for model checking
 VARIABLE cCommits
 
-clientVars == <<cTime, cViewID, cSeqNum, cReps, cCommits>>
+clientVars == <<cTime, cViewID, cReqID, cReps, cCommits>>
 
 (* Local replica state *)
 
@@ -171,37 +75,23 @@ VARIABLE rViewID
 \* A replica's commit log
 VARIABLE rLog
 
-\* The current log index for a replica
-VARIABLE rIndex
+\* A replica's sync index
+VARIABLE rSyncIndex
 
-\* The current sequence number for each session
-VARIABLE rSeqNum
+\* The view ID for the log
+VARIABLE rLogViewID
 
+\* The set of view change replies
+VARIABLE rViewChangeReps
 
-\* The highest known timestamp for all sessions
-VARIABLE rTimestamp
+replicaVars == <<rStatus, rViewID, rLog, rSyncIndex, rLogViewID, rViewChangeReps>>
 
-\* The last known normal view
-VARIABLE rLastViewID
-
-\* The set of received view change responses
-VARIABLE rViewChanges
-
-\* The point (client+sequence number) in the log currently being aborted
-VARIABLE rAbortPoint
-
-\* The set of abort responses received
-VARIABLE rAbortReps
-
-replicaVars == <<rStatus, rViewID, rLog, rIndex, rSeqNum, rTimestamp,
-                 rLastViewID, rViewChanges, rAbortPoint, rAbortReps>>
-
-vars == <<globalVars, messageVars, clientVars, replicaVars>>
+vars == <<messageVars, clientVars, replicaVars>>
 
 ----
 
 (*
-This section provides helpers for the spec.
+This section provides utilities for implementing the spec.
 *)
 
 \* Creates a sequence from set 'S'
@@ -212,15 +102,12 @@ SeqFromSet(S) ==
     ELSE LET x == CHOOSE x \in S : TRUE
         IN  << x >> \o SeqFromSet(S \ {x})
 
-\* Selects an element of set 'S'
-Pick(S) == CHOOSE s \in S : TRUE
-
 RECURSIVE SetReduce(_, _, _)
 SetReduce(Op(_, _), S, value) == 
     IF S = {} THEN
         value
     ELSE
-        LET s == Pick(S)
+        LET s == CHOOSE s \in S : TRUE
         IN SetReduce(Op, S \ {s}, Op(s, value)) 
 
 \* Computes the greatest vlue in set 'S'
@@ -230,17 +117,38 @@ Max(S) == CHOOSE x \in S : \A y \in S : x >= y
 Sum(S) == LET _op(a, b) == a + b
           IN SetReduce(_op, S, 0)
 
-\* A boolean indicating whether the given set is a quorum
-IsQuorum(s) == Cardinality(s) * 2 >= Cardinality(Replicas)
+\* The values of a sequence
+Range(s) == {s[i] : i \in DOMAIN s}
 
-\* The set of all quorums
-Quorums == {r \in SUBSET Replicas : IsQuorum(r)}
+----
+
+(*
+This section provides helpers for the protocol.
+*)
+
+\* A sorted sequence of replicas
+replicas == SeqFromSet(Replicas)
+
+\* The primary index for view 'v'
+PrimaryIndex(v) == (v%Len(replicas)) + (IF v >= Len(replicas) THEN 1 ELSE 0)
 
 \* The primary for view 'v'
-Primary(v) == replicas[(v%Len(replicas)) + (IF v >= Len(replicas) THEN 1 ELSE 0)]
+Primary(v) == replicas[PrimaryIndex(v)]
 
-\* A boolean indicating whether replica 'r' is the primary for the current view
-IsPrimary(r) == Primary(rViewID[r]) = r
+\* Quorum is the quorum for a given view
+Quorum(v) ==
+    LET
+        quorumSize == Len(replicas) \div 2 + 1
+        index(i)   == PrimaryIndex(v) + (i - 1)
+        member(i)  == IF index(i) > Len(replicas) THEN replicas[index(i)%Len(replicas)] ELSE replicas[index(i)]
+    IN 
+        {member(i) : i \in 1..quorumSize}
+
+\* A boolean indicating whether the given set is a quorum
+IsQuorum(S) == Cardinality(S) * 2 >= Cardinality(Replicas)
+
+\* A boolean indicating whether the given set is a quorum that includes the given replica
+IsLocalQuorum(r, S) == IsQuorum(S) /\ r \in S
 
 ----
 
@@ -252,22 +160,31 @@ This section models the network.
 Sends(ms) ==
     /\ messages'     = messages \cup ms
     /\ messageCount' = messageCount + Cardinality(ms)
+    /\ stepCount'    = stepCount + 1
 
 \* Send a message
 Send(m) == Sends({m})
 
-\* Reply to a message with a set of responses
-Replies(req, reps) == 
-    /\ messages'     = (messages \cup reps) \ {req}
-    /\ messageCount' = messageCount + Cardinality(reps)
-
-\* Reply to a message
-Reply(req, resp) == Replies(req, {resp})
-
-\* Discard a message
-Discard(m) == 
+\* Ack a message
+Ack(m) == 
     /\ messages'     = messages \ {m}
     /\ messageCount' = messageCount + 1
+    /\ stepCount'    = stepCount + 1
+
+\* Ack a message and send a set of messages
+AckAndSends(m, ms) == 
+    /\ messages'     = (messages \cup ms) \ {m}
+    /\ messageCount' = messageCount + Cardinality(ms)
+    /\ stepCount'    = stepCount + 1
+
+\* Ack and send a message
+AckAndSend(m, n) == AckAndSends(m, {n})
+
+\* Reply to a message with a set of responses
+Replies(req, reps) == AckAndSends(req, reps)
+
+\* Reply to a message
+Reply(req, resp) == AckAndSend(req, resp)
 
 ----
 
@@ -276,60 +193,86 @@ This section models client requests.
 *)
 
 \* Client 'c' sends value 'v' to all replicas
-\* Client requests are ordered globally using physical timestamps and locally (within
-\* the client) using client sequence numbers. Sequence numbers are sequential and unique
-\* within each view.
-\* When the client sends a request is generates a new timestamp. Physical timestamps
-\* are modeled here as a strictly increasing global clock simulating synchronized 
-\* system clocks. The sequence number for the client is also incremented and sent
-\* with the request.
 ClientRequest(c, v) ==
-    /\ cTime'   = cTime + 1
-    /\ cSeqNum' = [cSeqNum EXCEPT ![c] = cSeqNum[c] + 1]
+    /\ cTime' = cTime + 1
+    /\ cReqID' = [cReqID EXCEPT ![c] = cReqID[c] + 1]
     /\ Sends({[src       |-> c,
                dest      |-> r,
                type      |-> MClientRequest,
                viewID    |-> cViewID[c],
-               seqNum    |-> cSeqNum'[c],
+               reqID     |-> cReqID'[c],
                value     |-> v,
-               timestamp |-> cTime'] : r \in Replicas})
-    /\ UNCHANGED <<globalVars, replicaVars, cViewID, cReps, cCommits>>
+               timestamp |-> cTime'] : r \in Quorum(cViewID[c])})
+    /\ UNCHANGED <<replicaVars, cViewID, cReps, cCommits>>
 
 \* Client 'c' handles a response 'm' from replica 'r'
-\* When a response is received by the client, if the client is still in the request
-\* view it can process the response. The client is responsible for determining commitment
-\* by counting responses for each sequence number. Once a response is received from a
-\* majority of the replicas including the primary replica, the response is committed.
-\* Committed responses are stored in a history variable for checking against invariants.
 HandleClientReply(c, r, m) ==
-    /\ \/ /\ m.viewID = cViewID[c]
-          /\ cReps' = [cReps EXCEPT ![c] = cReps[c] \cup {m}]
-          /\ LET 
-                 okReps     == {n \in cReps'[c] : n.seqNum = m.seqNum /\ n.succeeded}
-                 hasPrimary == \E n \in okReps : Primary(n.viewID) = n.src
+       \* If the reply view ID does not match the request view ID, update the client's view.
+    /\ \/ /\ m.viewID # m.req.viewID
+          /\ \/ /\ cViewID[c] < m.viewID
+                /\ cViewID' = [cViewID EXCEPT ![c] = m.viewID]
+             \/ /\ cViewID[c] >= m.viewID
+                /\ UNCHANGED <<cViewID>>
+          /\ Ack(m)
+          /\ UNCHANGED <<cReps, cCommits>>
+       \* If the request and reply views match and the reply view matches the client's view,
+       \* aggregate the replies for the associated client request.
+       \/ /\ m.viewID = m.req.viewID
+          /\ m.viewID = cViewID[c]
+          /\ \/ /\ m.succeeded
+                /\ cReps' = [cReps EXCEPT ![c] = 
+                                (cReps[c] \ {n \in cReps[c] : /\ n.src       = m.src 
+                                                              /\ n.viewID    = cViewID[c]
+                                                              /\ n.req.reqID = m.req.reqID 
+                                                              /\ ~n.succeeded}) \cup {m}]
+             \/ /\ ~m.succeeded
+                /\ ~\E n \in cReps[c] : /\ n.src       = m.src 
+                                        /\ n.viewID    = cViewID[c]
+                                        /\ n.req.reqID = m.req.reqID
+                                        /\ n.succeeded
+                /\ cReps' = [cReps EXCEPT ![c] = cReps[c] \cup {m}]
+          /\ LET reps        == {n \in cReps'[c] : /\ n.viewID    = cViewID[c] 
+                                                   /\ n.req.reqID = m.req.reqID}
+                 isQuorum    == {n.src : n \in {n \in reps : n.succeeded}} = Quorum(cViewID[c])
+                 isCommitted == /\ \A n \in reps : n.succeeded
+                                /\ Cardinality({n.checksum : n \in reps}) = 1
+                 hasPrimary  == \E n \in reps : n.src = Primary(cViewID[c]) /\ n.succeeded
              IN
-                 IF hasPrimary THEN
-                    LET
-                        primaryRep  == CHOOSE n \in okReps : n.src = Primary(n.viewID)
-                        matchReps   == {n \in okReps : n.index = primaryRep.index}
-                        isCommitted == {n.src : n \in matchReps} \in Quorums
-                    IN
-                        IF isCommitted THEN
-                            cCommits' = [cCommits EXCEPT ![c] = cCommits[c] \cup {primaryRep}]
-                        ELSE
-                            UNCHANGED <<cCommits>>
-                 ELSE
-                     UNCHANGED <<cCommits>>
-          /\ UNCHANGED <<cViewID, cSeqNum>>
-       \/ /\ m.viewID > cViewID[c]
-          /\ cViewID' = [cViewID EXCEPT ![c] = m.viewID]
-          /\ cSeqNum' = [cSeqNum EXCEPT ![c] = 0]
-          /\ cReps'   = [cReps   EXCEPT ![c] = {}]
-          /\ UNCHANGED <<cCommits>>
-       \/ /\ m.viewID < cViewID[c]
-          /\ UNCHANGED <<cViewID, cSeqNum, cReps, cCommits>>
-    /\ Discard(m)
-    /\ UNCHANGED <<globalVars, replicaVars, cTime>>
+                 \* If a quorum of successful replies have been received and the checksums
+                 \* match, add the primary reply to commits.
+                 \/ /\ isQuorum
+                    /\ isCommitted
+                    /\ LET commit == CHOOSE n \in reps : n.src = Primary(cViewID[c])
+                       IN cCommits' = [cCommits EXCEPT ![c] = cCommits[c] \cup {commit}]
+                    /\ Ack(m)
+                 \* If some reply failed or was returned with an incorrect checksum,
+                 \* send a ReconcileRequest to the inconsistent node to force it to
+                 \* reconcile its log with the primary's log.
+                 \/ /\ ~isCommitted
+                    /\ \/ /\ hasPrimary
+                          /\ LET primaryRep == CHOOSE n \in reps : /\ n.src = Primary(cViewID[c]) 
+                                                                   /\ n.succeeded
+                                 retryReps  == {n \in reps :
+                                                  /\ n.src      # Primary(cViewID[c]) 
+                                                  /\ n.checksum # primaryRep.checksum}
+                             IN AckAndSends(m, {[src    |-> c,
+                                                 dest   |-> r,
+                                                 type   |-> MReconcileRequest,
+                                                 viewID |-> cViewID[c],
+                                                 reqID  |-> m.req.reqID,
+                                                 index  |-> primaryRep.index] : n \in retryReps})
+                       \/ /\ ~hasPrimary
+                          /\ Ack(m)
+                    /\ UNCHANGED <<cCommits>>
+                 \* If a quorum has not yet been reached, wait for more replies.
+                 \/ /\ ~isQuorum
+                    /\ isCommitted
+                    /\ Ack(m)
+                    /\ UNCHANGED <<cCommits>>
+          /\ UNCHANGED <<cViewID>>
+    /\ UNCHANGED <<replicaVars, cTime, cReqID>>
+
+HandleReconcileReply(c, r, m) == HandleClientReply(c, r, m)
 
 ----
 
@@ -337,305 +280,248 @@ HandleClientReply(c, r, m) ==
 This section models the replica protocol.
 *)
 
-\* Replica 'r' requests a repair of the client 'c' request 'm'
-Repair(r, c, m) ==
-    /\ Replies(m, {[src       |-> r,
-                    dest      |-> d,
-                    type      |-> MRepairRequest,
-                    viewID    |-> rViewID[r],
-                    client    |-> c,
-                    seqNum    |-> m.seqNum,
-                    timestamp |-> m.timestamp] : d \in Replicas})
-
-\* Replica 'r' aborts the client 'c' request 'm'
-Abort(r, c, m) ==
-    /\ IsPrimary(r)
-    /\ rStatus[r]   = SNormal
-    /\ rStatus'     = [rStatus     EXCEPT ![r] = SAborting]
-    /\ rAbortReps'  = [rAbortReps  EXCEPT ![r] = {}]
-    /\ rAbortPoint' = [rAbortPoint EXCEPT ![r] = [client |-> c, seqNum |-> m.seqNum]]
-    /\ Replies(m, {[src       |-> r,
-                    dest      |-> d,
-                    type      |-> MAbortRequest,
-                    viewID    |-> rViewID[r],
-                    client    |-> c,
-                    seqNum    |-> m.seqNum,
-                    timestamp |-> m.timestamp] : d \in Replicas})
-
 \* Replica 'r' handles client 'c' request 'm'
-\* Client requests with a view ID not matching the replica's view are rejected.
-\* Clients reset their sequence number of 
-\* For requests in the correct view, the request must be sequential and linear
-\* to be appended to the log. That is, the request must have a 'seqNum' that is
-\* 1 + the prior 'seqNum' for the client, and the 'timestamp' must be greater
-\* than all prior timestamps in the log. This is necessary to ensure the primary
-\* log does not change when requests are reordered. The client can retry requests
-\* that are reordered with a new sequence number and timestamp.
-\* To maintain consistency within the log, a separate sequence is maintained for
-\* each session (client), and each sequence number is assigned to a unique
-\* position in the session log. Session logs are logically merged into a totally
-\* ordered log using the request timestamps.
-\* When a sequence number is skipped, the primary must commit a TNoOp entry to
-\* the log. It does so by running the AbortRequest protocol.
-\* When a sequence number is skipped on a non-primary replica, the replica attempts
-\* to recover the request using the RepairRequest protocol.
 HandleClientRequest(r, c, m) ==
+    \* Client requests can only be handled while in the SNormal status.
     /\ rStatus[r] = SNormal
+       \* If the client's view matches the replica's view, process the client's request.
     /\ \/ /\ m.viewID = rViewID[r]
-          /\ LET
-                 index         == rIndex[r] + 1
-                 lastTimestamp == rTimestamp[r]
-                 isSequential  == m.seqNum = rSeqNum[r][c] + 1
-                 isLinear      == m.timestamp > lastTimestamp
-                 entry         == [type      |-> TValue, 
-                                   index     |-> index,
-                                   value     |-> m.value,
-                                   timestamp |-> m.timestamp]
-                 append(e)     == [rLog EXCEPT ![r] = [rLog[r] EXCEPT 
-                                               ![c] = Append(rLog[r][c], e)]]
+          /\ LET lastTimestamp == Max({rLog[r][i].timestamp : i \in DOMAIN rLog[r]} \cup {0})
              IN
-                \/ /\ isSequential
-                   /\ isLinear
-                   /\ rLog'       = append(entry)
-                   /\ rIndex'     = [rIndex     EXCEPT ![r] = index]
-                   /\ rSeqNum'    = [rSeqNum    EXCEPT ![r] = 
-                                        [rSeqNum[r] EXCEPT ![c] = m.seqNum]]
-                   /\ rTimestamp' = [rTimestamp EXCEPT ![r] = m.timestamp]
-                   /\ Reply(m, [src       |-> r,
-                                dest      |-> c,
-                                type      |-> MClientReply,
-                                viewID    |-> rViewID[r],
-                                seqNum    |-> m.seqNum,
-                                index     |-> index,
-                                timestamp |-> m.timestamp,
-                                value     |-> m.value,
-                                succeeded |-> TRUE])
-                   /\ UNCHANGED <<rStatus, rAbortPoint, rAbortReps>>
-                \/ /\ \/ /\ ~isSequential
-                         /\ m.seqNum > rSeqNum[r][c] + 1
-                      \/ ~isLinear
-                   /\ \/ /\ IsPrimary(r)
-                         /\ Abort(r, c, m)
-                      \/ /\ ~IsPrimary(r)
-                         /\ Repair(r, c, m)
-                         /\ UNCHANGED <<rStatus, rAbortPoint, rAbortReps>>
-                   /\ UNCHANGED <<rLog, rIndex, rSeqNum, rTimestamp>>
+                   \* If the request timestamp is greater than the highest log timestamp,
+                   \* append the entry to the log and return a successful response with
+                   \* the appended entry index.
+                /\ \/ /\ m.timestamp > lastTimestamp
+                      /\ rLog' = [rLog EXCEPT ![r] = 
+                                     Append(rLog[r], [value     |-> m.value,
+                                                      timestamp |-> m.timestamp])]
+                      /\ Reply(m, [src       |-> r,
+                                   dest      |-> c,
+                                   req       |-> m,
+                                   type      |-> MClientReply,
+                                   viewID    |-> rViewID[r],
+                                   index     |-> Len(rLog'[r]),
+                                   checksum  |-> rLog'[r],
+                                   value     |-> m.value,
+                                   timestamp |-> m.timestamp,
+                                   succeeded |-> TRUE])
+                   \* If the request timestamp matches the highest log timestamp, treat the
+                   \* request as a duplicate. Return a successful response indicating the
+                   \* entry was appended.
+                   \/ /\ m.timestamp = lastTimestamp
+                      /\ Reply(m, [src       |-> r,
+                                   dest      |-> c,
+                                   req       |-> m,
+                                   type      |-> MClientReply,
+                                   viewID    |-> rViewID[r],
+                                   index     |-> Len(rLog[r]),
+                                   checksum  |-> rLog[r],
+                                   value     |-> m.value,
+                                   timestamp |-> m.timestamp,
+                                   succeeded |-> TRUE])
+                      /\ UNCHANGED <<rLog>>
+                   \* If the request timestamp is less than the highest log timestamp,
+                   \* reject the request.
+                   \/ /\ m.timestamp < lastTimestamp
+                      /\ Reply(m, [src       |-> r,
+                                   dest      |-> c,
+                                   req       |-> m,
+                                   type      |-> MClientReply,
+                                   viewID    |-> rViewID[r],
+                                   index     |-> Len(rLog[r]),
+                                   checksum  |-> rLog[r],
+                                   value     |-> m.value,
+                                   timestamp |-> m.timestamp,
+                                   succeeded |-> FALSE])
+                      /\ UNCHANGED <<rLog>>
+          /\ UNCHANGED <<rViewID, rStatus, rViewChangeReps>>
+       \* If the client's view is greater than the replica's view, reject the client's
+       \* request with the outdated view ID and enter the view change protocol.
+       \/ /\ m.viewID > rViewID[r]
+          /\ rViewID'         = [rViewID         EXCEPT ![r] = m.viewID]
+          /\ rStatus'         = [rStatus         EXCEPT ![r] = SViewChange]
+          /\ rViewChangeReps' = [rViewChangeReps EXCEPT ![r] = {}]
+          /\ Replies(m, {[src       |-> r,
+                          dest      |-> c,
+                          req       |-> m,
+                          type      |-> MClientReply,
+                          viewID    |-> rViewID[r],
+                          succeeded |-> FALSE],
+                         [src       |-> r,
+                          dest      |-> Primary(m.viewID),
+                          type      |-> MViewChangeReply,
+                          viewID    |-> m.viewID,
+                          logViewID |-> rLogViewID[r],
+                          log       |-> rLog[r]]})
+          /\ UNCHANGED <<rLog>>
+       \* If the client's view is less than the replica's view, reject the client's request
+       \* with the updated view ID to force the client to retry.
        \/ /\ m.viewID < rViewID[r]
           /\ Reply(m, [src       |-> r,
                        dest      |-> c,
+                       req       |-> m,
                        type      |-> MClientReply,
                        viewID    |-> rViewID[r],
-                       seqNum    |-> m.seqNum,
                        succeeded |-> FALSE])
-          /\ UNCHANGED <<rStatus, rLog, rIndex, rSeqNum, rTimestamp, rAbortPoint, rAbortReps>>
-    /\ UNCHANGED <<globalVars, clientVars, rViewID, rLastViewID, rViewChanges>>
+          /\ UNCHANGED <<rViewID, rStatus, rLog, rViewChangeReps>>
+    /\ UNCHANGED <<clientVars, rLogViewID, rSyncIndex>>
 
-\* Replica 'r' handles replica 's' repair request 'm'
-\* When a repair request is received, if the requested sequence number is in the session
-\* log, the entry is returned. Otherwise, the primary aborts the request.
-HandleRepairRequest(r, s, m) ==
-    /\ m.viewID = rViewID[r]
-    /\ IsPrimary(r)
+HandleReconcileRequest(r, c, m) == 
     /\ rStatus[r] = SNormal
-    /\ LET offset == Len(rLog[r][m.client]) - (rSeqNum[r][m.client] - m.seqNum)
-       IN
-          \/ /\ offset <= Len(rLog[r][m.client])
-             /\ Reply(m, [src       |-> r,
-                          dest      |-> s,
-                          type      |-> MRepairReply,
-                          viewID    |-> rViewID[r],
-                          client    |-> m.client,
-                          seqNum    |-> m.seqNum,
-                          value     |-> rLog[r][m.client][offset].value,
-                          timestamp |-> rLog[r][m.client][offset].timestamp])
-             /\ UNCHANGED <<rStatus, rAbortPoint, rAbortReps>>
-          \/ /\ offset = Len(rLog[r][m.client]) + 1
-             /\ Abort(r, m.client, m)
-    /\ UNCHANGED <<globalVars, clientVars, rLog, rIndex, rSeqNum, rTimestamp, rViewID, rLastViewID, rViewChanges>>
+    /\ rViewID[r] = m.viewID
+    /\ \/ /\ rSyncIndex[r] >= m.index
+          /\ Reply(m, [src       |-> r,
+                       dest      |-> c,
+                       req       |-> m,
+                       type      |-> MReconcileReply,
+                       viewID    |-> rViewID[r],
+                       index     |-> m.index,
+                       checksum  |-> [i \in 1..m.index |-> rLog[r][i]],
+                       value     |-> rLog[r][m.index].value,
+                       timestamp |-> rLog[r][m.index].timestamp,
+                       succeeded |-> TRUE])
+          /\ UNCHANGED <<rStatus>>
+       \/ /\ rSyncIndex[r] < m.index
+          /\ Primary(rViewID[r]) # r
+          /\ rStatus' = [rStatus EXCEPT ![r] = SRepair]
+          /\ AckAndSend(m, [src    |-> r,
+                            dest   |-> Primary(rViewID[r]),
+                            req    |-> m,
+                            type   |-> MRepairRequest,
+                            viewID |-> rViewID[r],
+                            index  |-> m.index])
+    /\ UNCHANGED <<clientVars, rViewID, rLog, rLogViewID, rSyncIndex, rViewChangeReps>>
 
-\* Replica 'r' handles replica 's' repair response 'm'
-\* Repair responses are handled like client requests.
-HandleRepairReply(r, s, m) ==
-    HandleClientRequest(r, m.client, [m EXCEPT !.src = m.client])
+HandleRepairRequest(r, s, m) ==
+    /\ rStatus[r] = SNormal
+    /\ rViewID[r] = m.viewID
+    /\ Primary(rViewID[r]) = r
+    /\ Reply(m, [src    |-> r,
+                 dest   |-> s,
+                 req    |-> m.req,
+                 type   |-> MRepairReply,
+                 viewID |-> rViewID[r],
+                 index  |-> m.index,
+                 log    |-> [i \in 1..m.index |-> rLog[r][i]]])
+    /\ UNCHANGED <<clientVars, replicaVars>>
 
-\* Replica 'r' handles replica 's' abort request 'm'
-\* If the aborted sequence number is in the session log, the entry is replaced with
-\* a no-op entry. If the sequence number can be appebded to the log, it is.
-HandleAbortRequest(r, s, m) ==
-    /\ m.viewID = rViewID[r]
-    /\ rStatus[r] \in {SNormal, SAborting}
-    /\ LET 
-           offset == Len(rLog[r][m.client]) - (rSeqNum[r][m.client] - m.seqNum)
-           entry  == [type |-> TNoOp, value |-> Nil, timestamp |-> 0]
-       IN
-          /\ \/ /\ offset <= Len(rLog[r][m.client])
-                /\ rLog' = [rLog EXCEPT ![r] = [
-                            rLog[r] EXCEPT ![m.client] = [
-                            rLog[r][m.client] EXCEPT ![offset] = [
-                            rLog[r][m.client][offset] EXCEPT !.type = TNoOp]]]]
-                /\ UNCHANGED <<rTimestamp, rSeqNum>>
-             \/ /\ offset = Len(rLog[r][m.client]) + 1
-                /\ rLog' = [rLog EXCEPT ![r] = [
-                            rLog[r] EXCEPT ![m.client] = 
-                               Append(rLog[r][m.client], entry)]]
-                /\ rTimestamp' = [rTimestamp EXCEPT ![r] = Max({rTimestamp[r], m.timestamp})]
-                /\ rSeqNum'    = [rSeqNum    EXCEPT ![r] = [
-                                  rSeqNum[r] EXCEPT ![m.client] = m.seqNum]]
-          /\ Replies(m, {[src       |-> r,
-                          dest      |-> Primary(rViewID[r]),
-                          type      |-> MAbortReply,
-                          viewID    |-> rViewID[r],
-                          client    |-> m.client,
-                          seqNum    |-> m.seqNum],
-                         [src       |-> r,
-                          dest      |-> m.client,
-                          type      |-> MClientReply,
-                          viewID    |-> rViewID[r],
-                          seqNum    |-> m.seqNum,
-                          succeeded |-> FALSE]})
-    /\ UNCHANGED <<globalVars, clientVars, rStatus, rAbortPoint, 
-                   rAbortReps, rViewID, rLastViewID, rViewChanges>>
-
-\* Replica 'r' handles replica 's' repair response 'm'
-HandleAbortReply(r, s, m) ==
-    /\ rStatus[r] = SAborting
-    /\ m.viewID = rViewID[r]
-    /\ IsPrimary(r)
-    /\ m.seqNum = rAbortPoint[r].seqNum
-    /\ rAbortReps' = [rAbortReps EXCEPT ![r] = rAbortReps[r] \cup {m}]
-    /\ LET reps == {res.src : res \in {resp \in rAbortReps'[r] :
-                        /\ resp.viewID = rViewID[r]
-                        /\ resp.client = rAbortPoint[r].client
-                        /\ resp.seqNum = rAbortPoint[r].seqNum}}
-           isQuorum == r \in reps /\ reps \in Quorums
-       IN
-          \/ /\ isQuorum
-             /\ rStatus' = [rStatus EXCEPT ![r] = SNormal]
-          \/ /\ ~isQuorum
-             /\ UNCHANGED <<rStatus>>
-    /\ UNCHANGED <<globalVars, messageVars, clientVars, rLog, rIndex, rSeqNum, 
-                   rTimestamp, rAbortPoint, rViewID, rViewChanges, rLastViewID>>
+HandleRepairReply(r, s, m) == 
+    /\ rStatus[r] = SRepair
+    /\ rViewID[r] = m.viewID
+    /\ rStatus'    = [rStatus    EXCEPT ![r] = SNormal]
+    /\ rLog'       = [rLog       EXCEPT ![r] = m.log \o SubSeq(rLog[r], Len(m.log), Len(rLog[r]))]
+    /\ rSyncIndex' = [rSyncIndex EXCEPT ![r] = Len(rLog'[r])]
+    /\ Reply(m, [src       |-> r,
+                 dest      |-> m.req.src,
+                 req       |-> m.req,
+                 type      |-> MReconcileReply,
+                 viewID    |-> rViewID[r],
+                 index     |-> m.index,
+                 checksum  |-> m.log,
+                 value     |-> m.log[m.index].value,
+                 timestamp |-> m.log[m.index].timestamp,
+                 succeeded |-> TRUE])
+    /\ UNCHANGED <<clientVars, rViewID, rLogViewID, rViewChangeReps>>
 
 \* Replica 'r' requests a view change
-\* The view change is requested by sending a ViewChangeRequest to each replica.
 ChangeView(r) ==
     /\ Sends({[src    |-> r,
                dest   |-> d,
-               type   |-> MViewChangeRequest,
+               type   |-> MViewChange,
                viewID |-> rViewID[r] + 1] : d \in Replicas})
-    /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
+    /\ UNCHANGED <<clientVars, replicaVars>>
 
 \* Replica 'r' handles replica 's' view change request 'm'
-\* Replicas respond to ViewChangeRequests with the contents of their logs
-\* for reconciliation. When a new view change is requested, the replica updates
-\* its ViewID and transitions to the ViewChange status to block writes during
-\* the transition.
-HandleViewChangeRequest(r, s, m) ==
-    /\ rViewID[r] < m.viewID
-    /\ rViewID'      = [rViewID      EXCEPT ![r] = m.viewID]
-    /\ rStatus'      = [rStatus      EXCEPT ![r] = SViewChange]
-    /\ rViewChanges' = [rViewChanges EXCEPT ![r] = {}]
-    /\ Reply(m, [src        |-> r,
-                 dest       |-> Primary(m.viewID),
-                 type       |-> MViewChangeReply,
-                 viewID     |-> m.viewID,
-                 lastViewID |-> rLastViewID[r],
-                 log        |-> rLog[r]])
-    /\ UNCHANGED <<globalVars, clientVars, rLog, rIndex, rSeqNum,
-                   rTimestamp, rAbortPoint, rAbortReps, rLastViewID>>
+HandleViewChange(r, s, m) ==
+    /\ \/ /\ rViewID[r] < m.viewID
+          /\ rViewID'         = [rViewID         EXCEPT ![r] = m.viewID]
+          /\ rStatus'         = [rStatus         EXCEPT ![r] = SViewChange]
+          /\ rViewChangeReps' = [rViewChangeReps EXCEPT ![r] = {}]
+          /\ Reply(m, [src       |-> r,
+                       dest      |-> Primary(m.viewID),
+                       type      |-> MViewChangeReply,
+                       viewID    |-> m.viewID,
+                       logViewID |-> rLogViewID[r],
+                       log       |-> rLog[r]])
+       \/ /\ rViewID[r] >= m.viewID
+          /\ Ack(m)
+          /\ UNCHANGED <<rViewID, rStatus, rViewChangeReps>>
+    /\ UNCHANGED <<clientVars, rLog, rLogViewID, rSyncIndex>>
 
-\* Replica 'r' handles replica 's' view change response 'm'
-\* ViewChangeReplys are handled by the primary for the new view. Once
-\* responses are received from a majority of the replicas including the new
-\* primary, the logs received from each replica are merged together to form
-\* the log for the new view. For each known session, the logs from each replica
-\* are merged by comparing each entry and keeping all non-empty sequential
-\* entries in the quorum. An updated timestamp is calculated from the reconciled
-\* log, and a StartViewRequest containing the new logs is sent to each replica.
+\* Replica 'r' handles replica 's' view change reply 'm'
 HandleViewChangeReply(r, s, m) ==
-    /\ IsPrimary(r)
-    /\ rViewID[r]    = m.viewID
-    /\ rStatus[r]    = SViewChange
-    /\ rViewChanges' = [rViewChanges EXCEPT ![r] = rViewChanges[r] \cup {m}]
-    /\ LET viewChanges     == {v \in rViewChanges'[r] : v.viewID = rViewID[r]}
-           viewSources     == {v.src : v \in viewChanges}
-           isQuorum        == r \in viewSources /\ viewSources \in Quorums
-           lastViewIDs     == {v.lastViewID : v \in viewChanges}
-           lastViewID      == (CHOOSE v1 \in lastViewIDs : \A v2 \in lastViewIDs : v2 <= v1)
-           lastViewChanges == {v2 \in viewChanges : v2.lastViewID = lastViewID}
-           viewLogs        == [c \in Clients |-> {v1.log[c] : v1 \in lastViewChanges}]
-           mergeEnts(es)   ==
-               IF es = {} \/ \E e \in es : e.type = TNoOp THEN
-                   CHOOSE e \in es : e.type = TNoOp
-               ELSE
-                   CHOOSE e \in es : e.type # TNoOp /\ e.index = Max({f.index : f \in es})
-           range(ls)       == Max({Len(l) : l \in ls})
-           entries(ls, i)  == {l[i] : l \in {k \in ls : i <= Len(k)}}
-           mergeLogs(ls)   == [i \in 1..range(ls) |-> mergeEnts(entries(ls, i))]
-           viewLog         == [c \in Clients |-> mergeLogs(viewLogs[c])]
-           viewRange       == Max({Len(viewLog[c]) : c \in Clients})
-           liveEntries(l)  == {l[i] : i \in {i \in DOMAIN l : l[i].type # TNoOp}}
-           viewIndex       == Sum({Cardinality(liveEntries(viewLog[c])) : c \in Clients})
-           viewTimestamp   == IF viewRange > 0 THEN
-                                 Max(UNION {{l[i].timestamp : i \in DOMAIN l} :
-                                                l \in {viewLog[c] : c \in Clients}})
-                              ELSE 0
+    \* The view change protocol is run by the primary for the view.
+    /\ Primary(m.viewID) = r
+    /\ rViewID[r] = m.viewID
+    /\ rStatus[r] = SViewChange
+    /\ rViewChangeReps' = [rViewChangeReps EXCEPT ![r] = rViewChangeReps[r] \cup {m}]
+    /\ LET viewChanges == {v \in rViewChangeReps'[r] : v.viewID = rViewID[r]}
        IN
-           \/ /\ isQuorum
-              /\ Replies(m, {[src       |-> r,
-                              dest      |-> d,
-                              type      |-> MStartViewRequest,
-                              viewID    |-> rViewID[r],
-                              index     |-> viewIndex,
-                              timestamp |-> viewTimestamp,
-                              log       |-> viewLog] : d \in Replicas})
-           \/ /\ ~isQuorum
-              /\ Discard(m)
-    /\ UNCHANGED <<globalVars, clientVars, rStatus, rViewID, rLog, rIndex, 
-                   rSeqNum, rTimestamp, rAbortPoint, rAbortReps, rLastViewID>>
+           \* In order to ensure the new view is initialized with the latest view,
+           \* a quorum of view change replies must be received to guarantee the last
+           \* activated view is present in the set of replies.
+           \* If view change replies have been received from a majority of the replicas,
+           \* initialize the view using the log from the highest activated view.
+           \/ /\ IsLocalQuorum(r, {v.src : v \in viewChanges})
+              /\ LET latestViewID == Max({v.logViewID : v \in viewChanges})
+                     latestChange == CHOOSE v \in viewChanges : 
+                                         /\ v.logViewID = latestViewID 
+                                         /\ v.src \in Quorum(latestViewID)
+                 IN AckAndSends(m, {[src    |-> r,
+                                     dest   |-> d,
+                                     type   |-> MStartView,
+                                     viewID |-> rViewID[r],
+                                     log    |-> latestChange.log] : d \in Replicas})
+           \* If view change replies have not yet been received from a quorum, record
+           \* the view change reply and discard the message.
+           \/ /\ ~IsLocalQuorum(r, {v.src : v \in viewChanges})
+              /\ Ack(m)
+    /\ UNCHANGED <<clientVars, rStatus, rViewID, rLog, rLogViewID, rSyncIndex>>
 
 \* Replica 'r' handles replica 's' start view request 'm'
-\* If the view is new, the replica updates its logs and session state from the request.
-HandleStartViewRequest(r, s, m) ==
+HandleStartView(r, s, m) ==
+    \* To activate a view, the replica must either not know of the view or already
+    \* be participating in the view change protocol for the view.
     /\ \/ rViewID[r] < m.viewID
        \/ /\ rViewID[r] = m.viewID
           /\ rStatus[r] = SViewChange
-    /\ rLog'        = [rLog        EXCEPT ![r] = m.log]
-    /\ rSeqNum'     = [rSeqNum     EXCEPT ![r] = [c \in Clients |-> 0]]
-    /\ rIndex'      = [rIndex      EXCEPT ![r] = m.index]
-    /\ rTimestamp'  = [rTimestamp  EXCEPT ![r] = m.timestamp]
-    /\ rStatus'     = [rStatus     EXCEPT ![r] = SNormal]
-    /\ rViewID'     = [rViewID     EXCEPT ![r] = m.viewID]
-    /\ rLastViewID' = [rLastViewID EXCEPT ![r] = m.viewID]
-    /\ Discard(m)
-    /\ UNCHANGED <<globalVars, clientVars, rAbortPoint, rAbortReps, rViewChanges>>
+    \* If the replica is part of the quorum for the activated view, update the log
+    \* and record the activated view for use in the view change protocol.
+    /\ \/ /\ r \in Quorum(m.viewID)
+          /\ rLog'       = [rLog       EXCEPT ![r] = m.log]
+          /\ rLogViewID' = [rLogViewID EXCEPT ![r] = m.viewID]
+          /\ rSyncIndex' = [rSyncIndex EXCEPT ![r] = Len(m.log)]
+       \/ /\ r \notin Quorum(m.viewID)
+          /\ UNCHANGED <<rLog, rLogViewID, rSyncIndex>>
+    \* Update the replica's view ID and status and clean up view change state.
+    /\ rViewID' = [rViewID       EXCEPT ![r] = m.viewID]
+    /\ rStatus' = [rStatus       EXCEPT ![r] = SNormal]
+    /\ LET viewChanges == {v \in rViewChangeReps[r] : v.viewID = rViewID[r]}
+       IN  rViewChangeReps' = [rViewChangeReps EXCEPT ![r] = rViewChangeReps[r] \ viewChanges]
+    /\ Ack(m)
+    /\ UNCHANGED <<clientVars>>
 
 ----
-
 
 InitMessageVars ==
     /\ messages     = {}
     /\ messageCount = 0
+    /\ stepCount    = 0
 
 InitClientVars ==
     /\ cTime    = 0
     /\ cViewID  = [c \in Clients |-> 1]
-    /\ cSeqNum  = [c \in Clients |-> 0]
+    /\ cReqID   = [c \in Clients |-> 0]
     /\ cReps    = [c \in Clients |-> {}]
     /\ cCommits = [c \in Clients |-> {}]
 
 InitReplicaVars ==
-    /\ replicas     = SeqFromSet(Replicas)
-    /\ rStatus      = [r \in Replicas |-> SNormal]
-    /\ rViewID      = [r \in Replicas |-> 1]
-    /\ rLog         = [r \in Replicas |-> [c \in Clients |-> <<>>]]
-    /\ rIndex       = [r \in Replicas |-> 0]
-    /\ rSeqNum      = [r \in Replicas |-> [c \in Clients |-> 0]]
-    /\ rTimestamp   = [r \in Replicas |-> 0]
-    /\ rAbortPoint  = [r \in Replicas |-> [client |-> Nil, seqNum |-> 0]]
-    /\ rAbortReps   = [r \in Replicas |-> {}]
-    /\ rLastViewID  = [r \in Replicas |-> 1]
-    /\ rViewChanges = [r \in Replicas |-> {}]
+    /\ rStatus         = [r \in Replicas |-> SNormal]
+    /\ rViewID         = [r \in Replicas |-> 1]
+    /\ rLog            = [r \in Replicas |-> <<>>]
+    /\ rSyncIndex      = [r \in Replicas |-> 0]
+    /\ rLogViewID      = [r \in Replicas |-> 1]
+    /\ rViewChangeReps = [r \in Replicas |-> {}]
 
 Init ==
     /\ InitMessageVars
@@ -648,23 +534,16 @@ Init ==
 This section specifies the invariants for the protocol.
 *)
 
-\* Merge client logs together
-MergeLogs(l) ==
-    LET entries == UNION {{l[i][j] : j \in DOMAIN l[i]} : i \in DOMAIN l}
-    IN [i \in 1..Cardinality(entries) |-> CHOOSE e \in entries : e.index = i]
-
 \* The type invariant asserts that the leader's log will never contain a different
 \* value at the same index as a client commit.
-TypeOK ==
+Inv ==
     \A c \in Clients :
        \A e \in cCommits[c] :
           ~\E r \in Replicas :
-             /\ Primary(rViewID[r]) = r
              /\ rStatus[r] = SNormal
-             /\ LET logs == MergeLogs(rLog[r])
-                IN
-                   /\ Len(logs) >= e.index
-                   /\ logs[e.index].value # e.value
+             /\ rViewID[r] >= e.viewID
+             /\ r \in Quorum(rViewID[r])
+             /\ rLog[r][e.index].value # e.value
 
 ----
 
@@ -687,6 +566,16 @@ NextHandleClientReply ==
        /\ m.type = MClientReply
        /\ HandleClientReply(m.dest, m.src, m)
 
+NextHandleReconcileRequest ==
+    \E m \in messages :
+       /\ m.type = MReconcileRequest
+       /\ HandleReconcileRequest(m.dest, m.src, m)
+
+NextHandleReconcileReply ==
+    \E m \in messages :
+       /\ m.type = MReconcileReply
+       /\ HandleReconcileReply(m.dest, m.src, m)
+
 NextHandleRepairRequest ==
     \E m \in messages :
        /\ m.type = MRepairRequest
@@ -697,53 +586,43 @@ NextHandleRepairReply ==
        /\ m.type = MRepairReply
        /\ HandleRepairReply(m.dest, m.src, m)
 
-NextHandleAbortRequest ==
+NextHandleViewChange ==
     \E m \in messages :
-       /\ m.type = MAbortRequest
-       /\ HandleAbortRequest(m.dest, m.src, m)
-
-NextHandleAbortReply ==
-    \E m \in messages :
-       /\ m.type = MAbortReply
-       /\ HandleAbortReply(m.dest, m.src, m)
-
-NextHandleViewChangeRequest ==
-    \E m \in messages :
-       /\ m.type = MViewChangeRequest
-       /\ HandleViewChangeRequest(m.dest, m.src, m)
+       /\ m.type = MViewChange
+       /\ HandleViewChange(m.dest, m.src, m)
 
 NextHandleViewChangeReply ==
     \E m \in messages :
        /\ m.type = MViewChangeReply
        /\ HandleViewChangeReply(m.dest, m.src, m)
 
-NextHandleStartViewRequest ==
+NextHandleStartView ==
     \E m \in messages :
-       /\ m.type = MStartViewRequest
-       /\ HandleStartViewRequest(m.dest, m.src, m)
+       /\ m.type = MStartView
+       /\ HandleStartView(m.dest, m.src, m)
 
 NextDropMessage ==
     \E m \in messages :
-       /\ Discard(m)
-       /\ UNCHANGED <<globalVars, clientVars, replicaVars>>
+       /\ Ack(m)
+       /\ UNCHANGED <<clientVars, replicaVars>>
 
 Next ==
     \/ NextClientRequest
     \/ NextChangeView
     \/ NextHandleClientRequest
     \/ NextHandleClientReply
+    \/ NextHandleReconcileRequest
+    \/ NextHandleReconcileReply
     \/ NextHandleRepairRequest
     \/ NextHandleRepairReply
-    \/ NextHandleAbortRequest
-    \/ NextHandleAbortReply
-    \/ NextHandleViewChangeRequest
+    \/ NextHandleViewChange
     \/ NextHandleViewChangeReply
-    \/ NextHandleStartViewRequest
+    \/ NextHandleStartView
     \/ NextDropMessage
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Mon Sep 28 17:46:34 PDT 2020 by jordanhalterman
+\* Last modified Wed Sep 30 12:21:00 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
