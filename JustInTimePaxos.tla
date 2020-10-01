@@ -1,59 +1,87 @@
 -------------------------- MODULE JustInTimePaxos --------------------------
 
-(***************************************************************************)
-(* Defines the Just-In-Time Paxos (JITPaxos) protocol.  JITPaxos is a      *)
-(* variant of the Paxos consensus protocol designed for environments where *)
-(* process clocks are synchronized with high precision.  The protocol      *)
-(* relies on synchronized clocks to establish a global total ordering of   *)
-(* events, avoiding coordination between replicas when requests arrive in  *)
-(* the expected order, and reconciling requests only when they arrive out  *)
-(* of order.  This allows JITPaxos to reach consensus within a single      *)
-(* round trip in the normal case, falling back to traditional replication  *)
-(* strategies only when required.                                          *)
-(*                                                                         *)
-(* JITPaxos uses a view-based approach to elect a primary and reconcile    *)
-(* logs across views.  Views are identified by a monotonically increasing, *)
-(* globally unique view ID.  Each view deterministically assigns a quorum, *)
-(* and within the quorum a primary replica responsible for executing       *)
-(* client requests and reconciling inconsistencies in the logs of the      *)
-(* remaining replicas.  JITPaxos replicas to not coordinate with each      *)
-(* other in the normal case.  Clients send timestamped requests in         *)
-(* parallel to every replica in the view's quorum.  When a replica         *)
-(* receives a client request, if the request is received in chronological  *)
-(* order, it's appended to the replica's log.  If a request is received    *)
-(* out of order (i.e.  the request timestamp is less than the last         *)
-(* timestamp in the replica's log), the request is rejected by the         *)
-(* replica.  Clients are responsible for identifying inconsistencies in    *)
-(* the quorum's logs and initiating the reconciliation protocol.  To help  *)
-(* clients identify inconsistencies, replicas return a checksum            *)
-(* representing the contents of the log up to the request point with each  *)
-(* client reply.  If a client's request is received out of chronological   *)
-(* order, or if the checksums provided by the quorum do not match, the     *)
-(* client must initiate the reconcilitation protocol to reconcile the      *)
-(* inconsistencies in the quorum's logs.                                   *)
-(*                                                                         *)
-(* When requests are received out-of-order, the reconciliation protocol    *)
-(* works to re-order requests using the view's primary as a reference.     *)
-(* When a client initiates the reconciliation protocol for an inconsistent *)
-(* replica, the replica stops accepting client requests and sends a repair *)
-(* request to the primary.  The primary responds with the subset of the    *)
-(* log not yet reconciled on the replica, and the replica replaces the     *)
-(* out-of-order entries in its log.  Once the replica's log has been       *)
-(* reconciled with the primary, it can acknowledge the reconciled request  *)
-(* and begin accepting requests again.  Once a client has reconciled all   *)
-(* the divergent replicas and has received acknowledgement from each of    *)
-(* the replicas in the quorum, the request can be committed.               *)
-(*                                                                         *)
-(* View primaries and quorums are evenly distributed amongst view IDs.     *)
-(* View changes can be initiated to change the primary or the set of       *)
-(* replicas in the quorum.  When a view change is initiated, each replica  *)
-(* sends its log to the primary for the initiated view.  Once the primary  *)
-(* has received logs from a majority of replicas, it initializes the view  *)
-(* with the log from the most recent in-sync replica, broadcasting the log *)
-(* to its peers.  The use of quorums to determine both the commitment of a *)
-(* request and the initialization of new views ensures that each view log  *)
-(* contains all prior committed requests.                                  *)
-(***************************************************************************)
+(*
+Defines the Just-In-Time Paxos (JITPaxos) protocol.  JITPaxos is a
+variant of the Paxos consensus protocol designed for environments where
+process clocks are synchronized with high precision.  The protocol
+relies on synchronized clocks to establish a global total ordering of
+events, avoiding coordination between replicas when requests arrive in
+the expected order, and reconciling requests only when they arrive out
+of order.  This allows JITPaxos to reach consensus within a single
+round trip in the normal case, falling back to traditional replication
+strategies only when required.
+
+Summary:
+`^ \begin{describe}{*}
+\item[*] View-based protocol
+\item[*] Views are identified by a monotonically increasing, globally
+unique identifier
+\item[*] Each view assigns a primary plus a set of replicas that form
+the quorum
+\item[*] Clients timestamp each request and send in parallel to all
+replicas in the quorum
+\item[*] Each replica appends requests to a log in chronological order,
+and the primary executes requests
+\item[*] If a request is received out of chronological order it is
+rejected
+\item[*] Replies to clients include a checksum of the log on each
+replica
+\item[*] If the client receives a reply indicating the request was
+received out of chronological order or if a checksum does not match
+the primary's checksum, the client initiates a reconciliation protocol
+\item[*] To reconcile inconsistencies in the log, replicas pull logs
+from the primary, and once logs have been reconciled the original
+request is acknowledged
+\item[*] Once the client receives matching acknowledgements from all
+the replicas in the quorum a request is committed
+\item[*] View changes select the most recent log from a majority of the
+replicas to ensure the initial view log contains all committed requests
+from prior views
+\end{describe} ^'
+
+JITPaxos uses a view-based approach to elect a primary and reconcile
+logs across views.  Views are identified by a monotonically increasing,
+globally unique view ID.  Each view deterministically assigns a quorum,
+and within the quorum a primary replica responsible for executing
+client requests and reconciling inconsistencies in the logs of the
+remaining replicas.  JITPaxos replicas to not coordinate with each
+other in the normal case.  Clients send timestamped requests in
+parallel to every replica in the view's quorum.  When a replica
+receives a client request, if the request is received in chronological
+order, it's appended to the replica's log.  If a request is received
+out of order (i.e.  the request timestamp is less than the last
+timestamp in the replica's log), the request is rejected by the
+replica.  Clients are responsible for identifying inconsistencies in
+the quorum's logs and initiating the reconciliation protocol.  To help
+clients identify inconsistencies, replicas return a checksum
+representing the contents of the log up to the request point with each
+client reply.  If a client's request is received out of chronological
+order, or if the checksums provided by the quorum do not match, the
+client must initiate the reconcilitation protocol to reconcile the
+inconsistencies in the quorum's logs.
+
+When requests are received out-of-order, the reconciliation protocol
+works to re-order requests using the view's primary as a reference.
+When a client initiates the reconciliation protocol for an inconsistent
+replica, the replica stops accepting client requests and sends a repair
+request to the primary.  The primary responds with the subset of the
+log not yet reconciled on the replica, and the replica replaces the
+out-of-order entries in its log.  Once the replica's log has been
+reconciled with the primary, it can acknowledge the reconciled request
+and begin accepting requests again.  Once a client has reconciled all
+the divergent replicas and has received acknowledgement from each of
+the replicas in the quorum, the request can be committed.
+
+View primaries and quorums are evenly distributed amongst view IDs.
+View changes can be initiated to change the primary or the set of
+replicas in the quorum.  When a view change is initiated, each replica
+sends its log to the primary for the initiated view.  Once the primary
+has received logs from a majority of replicas, it initializes the view
+with the log from the most recent in-sync replica, broadcasting the log
+to its peers.  The use of quorums to determine both the commitment of a
+request and the initialization of new views ensures that each view log
+contains all prior committed requests.
+*)
 
 EXTENDS Naturals, Reals, Sequences, FiniteSets, TLC
 
@@ -305,6 +333,9 @@ IsLocalQuorum(r, S) == IsQuorum(S) /\ r \in S
 
 (*
 This section models the network.
+
+Messages between processes are unordered and can be dropped by the network
+at any time.
 *)
 
 \* Send a set of messages
@@ -340,7 +371,7 @@ Reply(req, resp) == AckAndSend(req, resp)
 ----
 
 (*
-This section models client requests.
+This section models JITPaxos clients.
 *)
 
 \* Client 'c' sends value 'v' to all replicas
@@ -428,7 +459,7 @@ HandleReconcileReply(c, r, m) == HandleClientReply(c, r, m)
 ----
 
 (*
-This section models the replica protocol.
+This section models JITPaxos replicas.
 *)
 
 \* Replica 'r' handles client 'c' request 'm'
@@ -776,5 +807,5 @@ Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Wed Sep 30 18:02:32 PDT 2020 by jordanhalterman
+\* Last modified Thu Oct 01 11:01:54 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
