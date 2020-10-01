@@ -1,11 +1,66 @@
 -------------------------- MODULE JustInTimePaxos --------------------------
 
+(***************************************************************************)
+(* Defines the Just-In-Time Paxos (JITPaxos) protocol.  JITPaxos is a      *)
+(* variant of the Paxos consensus protocol designed for environments where *)
+(* process clocks are synchronized with high precision.  The protocol      *)
+(* relies on synchronized clocks to establish a global total ordering of   *)
+(* events, avoiding coordination between replicas when requests arrive in  *)
+(* the expected order, and reconciling requests only when they arrive out  *)
+(* of order.  This allows JITPaxos to reach consensus within a single      *)
+(* round trip in the normal case, falling back to traditional replication  *)
+(* strategies only when required.                                          *)
+(*                                                                         *)
+(* JITPaxos uses a view-based approach to elect a primary and reconcile    *)
+(* logs across views.  Views are identified by a monotonically increasing, *)
+(* globally unique view ID.  Each view deterministically assigns a quorum, *)
+(* and within the quorum a primary replica responsible for executing       *)
+(* client requests and reconciling inconsistencies in the logs of the      *)
+(* remaining replicas.  JITPaxos replicas to not coordinate with each      *)
+(* other in the normal case.  Clients send timestamped requests in         *)
+(* parallel to every replica in the view's quorum.  When a replica         *)
+(* receives a client request, if the request is received in chronological  *)
+(* order, it's appended to the replica's log.  If a request is received    *)
+(* out of order (i.e.  the request timestamp is less than the last         *)
+(* timestamp in the replica's log), the request is rejected by the         *)
+(* replica.  Clients are responsible for identifying inconsistencies in    *)
+(* the quorum's logs and initiating the reconciliation protocol.  To help  *)
+(* clients identify inconsistencies, replicas return a checksum            *)
+(* representing the contents of the log up to the request point with each  *)
+(* client reply.  If a client's request is received out of chronological   *)
+(* order, or if the checksums provided by the quorum do not match, the     *)
+(* client must initiate the reconcilitation protocol to reconcile the      *)
+(* inconsistencies in the quorum's logs.                                   *)
+(*                                                                         *)
+(* When requests are received out-of-order, the reconciliation protocol    *)
+(* works to re-order requests using the view's primary as a reference.     *)
+(* When a client initiates the reconciliation protocol for an inconsistent *)
+(* replica, the replica stops accepting client requests and sends a repair *)
+(* request to the primary.  The primary responds with the subset of the    *)
+(* log not yet reconciled on the replica, and the replica replaces the     *)
+(* out-of-order entries in its log.  Once the replica's log has been       *)
+(* reconciled with the primary, it can acknowledge the reconciled request  *)
+(* and begin accepting requests again.  Once a client has reconciled all   *)
+(* the divergent replicas and has received acknowledgement from each of    *)
+(* the replicas in the quorum, the request can be committed.               *)
+(*                                                                         *)
+(* View primaries and quorums are evenly distributed amongst view IDs.     *)
+(* View changes can be initiated to change the primary or the set of       *)
+(* replicas in the quorum.  When a view change is initiated, each replica  *)
+(* sends its log to the primary for the initiated view.  Once the primary  *)
+(* has received logs from a majority of replicas, it initializes the view  *)
+(* with the log from the most recent in-sync replica, broadcasting the log *)
+(* to its peers.  The use of quorums to determine both the commitment of a *)
+(* request and the initialization of new views ensures that each view log  *)
+(* contains all prior committed requests.                                  *)
+(***************************************************************************)
+
 EXTENDS Naturals, Reals, Sequences, FiniteSets, TLC
 
-\* The set of Paxos replicas
+\* The set of JITPaxos replicas
 CONSTANT Replicas
 
-\* The set of Paxos clients
+\* The set of JITPaxos clients
 CONSTANT Clients
 
 \* The set of possible values
@@ -22,15 +77,111 @@ CONSTANTS
     MReconcileReply,
     MRepairRequest,
     MRepairReply,
-    MViewChange,
+    MViewChangeRequest,
     MViewChangeReply,
-    MStartView
+    MStartViewRequest
 
 \* Replica statuses
 CONSTANTS
-    SNormal,
+    SInSync,
     SRepair,
     SViewChange
+----
+
+(***************************************************************************)
+(* This section specifies the message types and schemas used in this spec. *)
+(*                                                                         *)
+(* ReqIDs == [c \in Clients |-> i \in (1..)]                               *)
+(*                                                                         *)
+(* ViewIDs == [r \in Replicas |-> i \in (1..)]                             *)
+(*                                                                         *)
+(* Logs == [r \in Replicas |-> [i \in (1..) |-> Value]]                    *)
+(*                                                                         *)
+(* Indexes == [r \in Replicas |-> i \in (1..)]                             *)
+(*                                                                         *)
+(* Timestamps == [r \in Replicas |-> i \in (1..)]                          *)
+(*                                                                         *)
+(* Checksums == [r \in Replicas |-> [i \in (1..) |-> t \in Timestamps]]    *)
+(*                                                                         *)
+(*   ClientRequest                                                         *)
+(*     [ src       |-> c \in Clients,                                      *)
+(*       dest      |-> r \in Replicas,                                     *)
+(*       type      |-> MClientRequest,                                     *)
+(*       viewID    |-> i \in ViewIDs,                                      *)
+(*       reqID     |-> i \in ReqIDs,                                       *)
+(*       value     |-> v \in Values,                                       *)
+(*       timestamp |-> t \in Timestamps ]                                  *)
+(*                                                                         *)
+(*   ClientReply                                                           *)
+(*     [ src       |-> r \in Replicas,                                     *)
+(*       dest      |-> c \in Clients,                                      *)
+(*       req       |-> (ClientRequest),                                    *)
+(*       type      |-> MClientReply,                                       *)
+(*       viewID    |-> i \in ViewIDs,                                      *)
+(*       index     |-> i \in Indexes,                                      *)
+(*       checksum  |-> c \in Checksums,                                    *)
+(*       value     |-> v \in Values,                                       *)
+(*       timestamp |-> t \in Timestamps,                                   *)
+(*       succeeded |-> TRUE \/ FALSE ]                                     *)
+(*                                                                         *)
+(*   ReconcileRequest                                                      *)
+(*     [ src    |-> c \in Clients,                                         *)
+(*       dest   |-> r \in Replicas,                                        *)
+(*       type   |-> MReconcileRequest,                                     *)
+(*       viewID |-> i \in ViewIDs,                                         *)
+(*       reqID  |-> i \in ReqIDs,                                          *)
+(*       index  |-> i \in Indexes ]                                        *)
+(*                                                                         *)
+(*   ReconcileReply                                                        *)
+(*     [ src       |-> r \in Replicas,                                     *)
+(*       dest      |-> c \in Clients,                                      *)
+(*       req       |-> (ClientRequest),                                    *)
+(*       type      |-> MReconcileReply,                                    *)
+(*       viewID    |-> i \in ViewIDs,                                      *)
+(*       index     |-> i \in Indexes,                                      *)
+(*       checksum  |-> c \in Checksums,                                    *)
+(*       value     |-> v \in Values,                                       *)
+(*       timestamp |-> t \in Timestamps,                                   *)
+(*       succeeded |-> TRUE \/ FALSE ]                                     *)
+(*                                                                         *)
+(*   RepairRequest                                                         *)
+(*     [ src    |-> r \in Replicas,                                        *)
+(*       dest   |-> r \in Replicas,                                        *)
+(*       req    |-> (ClientRequest),                                       *)
+(*       type   |-> MRepairRequest,                                        *)
+(*       viewID |-> i \in ViewIDs,                                         *)
+(*       index  |-> i \in Indexes ]                                        *)
+(*                                                                         *)
+(*   RepairReply                                                           *)
+(*     [ src    |-> r \in Replicas,                                        *)
+(*       dest   |-> r \in Replicas,                                        *)
+(*       req    |-> (ClientRequest),                                       *)
+(*       type   |-> MRepairReply,                                          *)
+(*       viewID |-> i \in ViewIDs,                                         *)
+(*       index  |-> i \in Indexes,                                         *)
+(*       log    |-> l \in Logs ]                                           *)
+(*                                                                         *)
+(*   ViewChangeRequest                                                     *)
+(*     [ src    |-> r \in Replicas,                                        *)
+(*       dest   |-> r \in Replicas,                                        *)
+(*       type   |-> MViewChangeRequest,                                    *)
+(*       viewID |-> i \in ViewIDs ]                                        *)
+(*                                                                         *)
+(*   ViewChangeReply                                                       *)
+(*     [ src       |-> r \in Replicas,                                     *)
+(*       dest      |-> r \in Replicas,                                     *)
+(*       type      |-> MViewChangeReply,                                   *)
+(*       viewID    |-> i \in ViewIDs,                                      *)
+(*       logViewID |-> i \in ViewIDs,                                      *)
+(*       log       |-> l \in Logs ]                                        *)
+(*                                                                         *)
+(*   StartViewRequest                                                      *)
+(*     [ src    |-> r \in Replicas,                                        *)
+(*       dest   |-> r \in Replicas,                                        *)
+(*       type   |-> MStartViewRequest,                                     *)
+(*       viewID |-> i \in ViewIDs,                                         *)
+(*       log    |-> l \in Logs ]                                           *)
+(***************************************************************************)
 
 ----
 
@@ -282,8 +433,8 @@ This section models the replica protocol.
 
 \* Replica 'r' handles client 'c' request 'm'
 HandleClientRequest(r, c, m) ==
-    \* Client requests can only be handled while in the SNormal status.
-    /\ rStatus[r] = SNormal
+    \* Client requests can only be handled if the replica is in-sync.
+    /\ rStatus[r] = SInSync
        \* If the client's view matches the replica's view, process the client's request.
     /\ \/ /\ m.viewID = rViewID[r]
           /\ LET lastTimestamp == Max({rLog[r][i].timestamp : i \in DOMAIN rLog[r]} \cup {0})
@@ -367,7 +518,7 @@ HandleClientRequest(r, c, m) ==
     /\ UNCHANGED <<clientVars, rLogViewID, rSyncIndex>>
 
 HandleReconcileRequest(r, c, m) == 
-    /\ rStatus[r] = SNormal
+    /\ rStatus[r] = SInSync
     /\ rViewID[r] = m.viewID
     /\ \/ /\ rSyncIndex[r] >= m.index
           /\ Reply(m, [src       |-> r,
@@ -393,7 +544,7 @@ HandleReconcileRequest(r, c, m) ==
     /\ UNCHANGED <<clientVars, rViewID, rLog, rLogViewID, rSyncIndex, rViewChangeReps>>
 
 HandleRepairRequest(r, s, m) ==
-    /\ rStatus[r] = SNormal
+    /\ rStatus[r] = SInSync
     /\ rViewID[r] = m.viewID
     /\ Primary(rViewID[r]) = r
     /\ Reply(m, [src    |-> r,
@@ -408,7 +559,7 @@ HandleRepairRequest(r, s, m) ==
 HandleRepairReply(r, s, m) == 
     /\ rStatus[r] = SRepair
     /\ rViewID[r] = m.viewID
-    /\ rStatus'    = [rStatus    EXCEPT ![r] = SNormal]
+    /\ rStatus'    = [rStatus    EXCEPT ![r] = SInSync]
     /\ rLog'       = [rLog       EXCEPT ![r] = m.log \o SubSeq(rLog[r], Len(m.log), Len(rLog[r]))]
     /\ rSyncIndex' = [rSyncIndex EXCEPT ![r] = Len(rLog'[r])]
     /\ Reply(m, [src       |-> r,
@@ -427,12 +578,12 @@ HandleRepairReply(r, s, m) ==
 ChangeView(r) ==
     /\ Sends({[src    |-> r,
                dest   |-> d,
-               type   |-> MViewChange,
+               type   |-> MViewChangeRequest,
                viewID |-> rViewID[r] + 1] : d \in Replicas})
     /\ UNCHANGED <<clientVars, replicaVars>>
 
 \* Replica 'r' handles replica 's' view change request 'm'
-HandleViewChange(r, s, m) ==
+HandleViewChangeRequest(r, s, m) ==
     /\ \/ /\ rViewID[r] < m.viewID
           /\ rViewID'         = [rViewID         EXCEPT ![r] = m.viewID]
           /\ rStatus'         = [rStatus         EXCEPT ![r] = SViewChange]
@@ -469,7 +620,7 @@ HandleViewChangeReply(r, s, m) ==
                                          /\ v.src \in Quorum(latestViewID)
                  IN AckAndSends(m, {[src    |-> r,
                                      dest   |-> d,
-                                     type   |-> MStartView,
+                                     type   |-> MStartViewRequest,
                                      viewID |-> rViewID[r],
                                      log    |-> latestChange.log] : d \in Replicas})
            \* If view change replies have not yet been received from a quorum, record
@@ -479,7 +630,7 @@ HandleViewChangeReply(r, s, m) ==
     /\ UNCHANGED <<clientVars, rStatus, rViewID, rLog, rLogViewID, rSyncIndex>>
 
 \* Replica 'r' handles replica 's' start view request 'm'
-HandleStartView(r, s, m) ==
+HandleStartViewRequest(r, s, m) ==
     \* To activate a view, the replica must either not know of the view or already
     \* be participating in the view change protocol for the view.
     /\ \/ rViewID[r] < m.viewID
@@ -494,8 +645,8 @@ HandleStartView(r, s, m) ==
        \/ /\ r \notin Quorum(m.viewID)
           /\ UNCHANGED <<rLog, rLogViewID, rSyncIndex>>
     \* Update the replica's view ID and status and clean up view change state.
-    /\ rViewID' = [rViewID       EXCEPT ![r] = m.viewID]
-    /\ rStatus' = [rStatus       EXCEPT ![r] = SNormal]
+    /\ rViewID' = [rViewID EXCEPT ![r] = m.viewID]
+    /\ rStatus' = [rStatus EXCEPT ![r] = SInSync]
     /\ LET viewChanges == {v \in rViewChangeReps[r] : v.viewID = rViewID[r]}
        IN  rViewChangeReps' = [rViewChangeReps EXCEPT ![r] = rViewChangeReps[r] \ viewChanges]
     /\ Ack(m)
@@ -516,7 +667,7 @@ InitClientVars ==
     /\ cCommits = [c \in Clients |-> {}]
 
 InitReplicaVars ==
-    /\ rStatus         = [r \in Replicas |-> SNormal]
+    /\ rStatus         = [r \in Replicas |-> SInSync]
     /\ rViewID         = [r \in Replicas |-> 1]
     /\ rLog            = [r \in Replicas |-> <<>>]
     /\ rSyncIndex      = [r \in Replicas |-> 0]
@@ -534,13 +685,14 @@ Init ==
 This section specifies the invariants for the protocol.
 *)
 
-\* The type invariant asserts that the leader's log will never contain a different
-\* value at the same index as a client commit.
-Inv ==
+\* The linearizability invariant verifies that once a client has received matching
+\* acks from a quorum and committed a value, thereafter the value is always present 
+\* at the committed index on all in-sync replicas.
+Linearizability == 
     \A c \in Clients :
        \A e \in cCommits[c] :
           ~\E r \in Replicas :
-             /\ rStatus[r] = SNormal
+             /\ rStatus[r] = SInSync
              /\ rViewID[r] >= e.viewID
              /\ r \in Quorum(rViewID[r])
              /\ rLog[r][e.index].value # e.value
@@ -586,20 +738,20 @@ NextHandleRepairReply ==
        /\ m.type = MRepairReply
        /\ HandleRepairReply(m.dest, m.src, m)
 
-NextHandleViewChange ==
+NextHandleViewChangeRequest ==
     \E m \in messages :
-       /\ m.type = MViewChange
-       /\ HandleViewChange(m.dest, m.src, m)
+       /\ m.type = MViewChangeRequest
+       /\ HandleViewChangeRequest(m.dest, m.src, m)
 
 NextHandleViewChangeReply ==
     \E m \in messages :
        /\ m.type = MViewChangeReply
        /\ HandleViewChangeReply(m.dest, m.src, m)
 
-NextHandleStartView ==
+NextHandleStartViewRequest ==
     \E m \in messages :
-       /\ m.type = MStartView
-       /\ HandleStartView(m.dest, m.src, m)
+       /\ m.type = MStartViewRequest
+       /\ HandleStartViewRequest(m.dest, m.src, m)
 
 NextDropMessage ==
     \E m \in messages :
@@ -615,14 +767,14 @@ Next ==
     \/ NextHandleReconcileReply
     \/ NextHandleRepairRequest
     \/ NextHandleRepairReply
-    \/ NextHandleViewChange
+    \/ NextHandleViewChangeRequest
     \/ NextHandleViewChangeReply
-    \/ NextHandleStartView
+    \/ NextHandleStartViewRequest
     \/ NextDropMessage
 
 Spec == Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
-\* Last modified Wed Sep 30 12:21:00 PDT 2020 by jordanhalterman
+\* Last modified Wed Sep 30 18:02:32 PDT 2020 by jordanhalterman
 \* Created Fri Sep 18 22:45:21 PDT 2020 by jordanhalterman
